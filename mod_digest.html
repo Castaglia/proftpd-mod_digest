@@ -1,0 +1,118 @@
+<html>
+<head>
+<title>ProFTPD module mod_digest</title>
+</head>
+
+<body bgcolor=white>
+
+<hr>
+<center>
+<h2><b>ProFTPD module <code>mod_digest</code></b></h2>
+</center>
+<hr><br>
+
+The <code>mod_digest</code> module offers functions to calculate the hash value or digest of files. This is particularly useful to verify the integrity of files.
+<br><br>
+Depending on the file size and the hash function it takes a fair amount of CPU and IO resources to calculate the result. Therefore decide wisely where to enable the features and set the <a href="#DigestMaxSize">DigestMaxSize</a> configuration directive appropriately.
+It's also recommended to disable all features within the &lt;Anonymous&gt; context.
+
+<p>
+This module was compiled and tested against ProFTPD 1.3.3 Installation
+instructions are discussed <a href="#Installation">here</a>.
+
+<p>
+The most current version of <code>mod_digest</code> can be found at:
+<pre>
+  <a href="http://www.smartftp.com/oss/proftpd/">http://www.smartftp.com/oss/proftpd/</a>
+</pre>
+
+<h2>Author</h2>
+<p>
+Please contact Mathias Berchtold &lt;mb <i>at</i> smartftp.com&gt; with any
+questions, concerns, or suggestions regarding this module.
+
+<h2>Directives</h2>
+<ul>
+  <li><a href="#DigestTypes">DigestTypes</a>
+  <li><a href="#DigestMaxSize">DigestMaxSize</a>  	
+</ul>
+
+<hr>
+<h2><a name="DigestTypes">DigestTypes</a></h2>
+<strong>Syntax:</strong>DigestTypes <em>[ "crc32" | "md5" | "sha1" | "sha256" | "all" ]</em><br>
+<strong>Default:</strong> all<br>
+<strong>Context:</strong> server config, &lt;VirtualHost&gt;, &lt;Global&gt;, &lt;Anonymous&gt;<br>
+<strong>Module:</strong> mod_digest<br>
+<strong>Compatibility:</strong> 1.3.3 or later
+
+<p>
+The <code>DigestTypes</code> directive configures the enabled digest/hash algorithms. If no <code>DigestTypes</code> directive is configured, then all digest algorithms are enabled. 
+Digest algorithms enabled are announced in the server FEAT reply. Following a list of digest types with the corresponding FTP command:<br>
+<table>
+	<tr><th>Digest Type</th><th>FTP Command</th></tr>
+	<tr><td>crc32</td><td>XCRC</td></tr>
+	<tr><td>md5</td><td>XMD5</td></tr>
+	<tr><td>sha1</td><td>XSHA1</td></tr>
+	<tr><td>sha256</td><td>XSHA256</td></tr>	
+	<tr><td>all</td><td>Enables all</td></tr>
+</table>
+
+<hr>
+<h2><a name="DigestMaxSize">DigestMaxSize</a></h2>
+<strong>Syntax:</strong>DigestMaxSize <em>number</em><br>
+<strong>Default:</strong> unlimited<br>
+<strong>Context:</strong> server config, &lt;VirtualHost&gt;, &lt;Global&gt;, &lt;Anonymous&gt;<br>
+<strong>Module:</strong> mod_digest<br>
+<strong>Compatibility:</strong> 1.3.3 or later
+
+<p>
+The <code>DigestMaxSize</code> directive configures the maximum number of bytes a single hash command is allowed to read from a file.
+If the number of bytes to be read from the file is greater than the configured limit the server will return an error.
+If no <code>DigestMaxSize</code> directive is configured, then there is no limit. It is stronly recommended to set an upper limit.
+
+<p>
+<hr>
+<h2><a name="Installation">Installation</a></h2>
+To install <code>mod_digest</code>, copy the <code>mod_digest.c</code> file
+into <pre>
+  <i>proftpd-dir</i>/contrib/
+</pre>
+Unpack the latest proftpd-1.3.<i>x</i> source code, then follow the
+usual steps for using third-party modules in proftpd:
+<pre>
+  ./configure --with-modules=mod_digest
+  make
+  make install
+</pre>
+
+<p>
+<hr>
+<h2>Usage</h2>
+Example Configuration
+<pre>
+  &lt;IfModule mod_digest.c&gt;
+    DigestTypes all
+    DigestMaxSize 104857600 # 100MB
+  &lt;/IfModule&gt;
+</pre>
+
+
+
+<p>
+<hr><br>
+
+Author: <i>Mathias Berchtold</i><br>
+Last Updated: <i>10/29/2010 23:57 PM</i><br>
+
+<br><hr>
+
+<font size=2><b><i>
+&copy; Copyright <a href="http://www.smartftp.com">SmartFTP</a><br>
+ All Rights Reserved<br>
+</i></b></font>
+
+<hr><br>
+
+</body>
+</html>
+
