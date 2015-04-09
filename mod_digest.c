@@ -1006,7 +1006,7 @@ MODRET digest_set_maxsize(cmd_rec *cmd) {
   *((size_t *) c->argv[0]) = lValue;
   c->flags |= CF_MERGEDOWN;
 
-  return HANDLED(cmd);
+  return PR_HANDLED(cmd);
 }
 
 typedef struct {
@@ -1073,7 +1073,7 @@ MODRET digest_set_types(cmd_rec *cmd) {
   c->argv[0] = ah;
   c->flags |= CF_MERGEDOWN;
 
-  return HANDLED(cmd);
+  return PR_HANDLED(cmd);
 }
 
 /* returns 1 if enabled. 0 otherwise */
@@ -1216,7 +1216,7 @@ MODRET digest_cmdex(cmd_rec *cmd) {
   /* Note: no support for "CMD file endposition" because it's implemented differently by other FTP servers */
   if(cmd->argc == 3) {
     pr_response_add_err(R_501, "Invalid number of arguments.");
-    return ERROR((cmd));
+    return PR_ERROR((cmd));
   }
 
   path = dir_realpath(cmd->tmp_pool, cmd->argv[1]);
@@ -1225,12 +1225,12 @@ MODRET digest_cmdex(cmd_rec *cmd) {
       !dir_check(cmd->tmp_pool, cmd, cmd->group, path, NULL) ||
       pr_fsio_stat(path, &sbuf) == -1) {
     pr_response_add_err(R_550,"%s: %s", cmd->argv[1], strerror(errno));
-    return ERROR(cmd);
+    return PR_ERROR(cmd);
   }
   else {
     if (!S_ISREG(sbuf.st_mode)) {
       pr_response_add_err(R_550,"%s: not a plain file.",cmd->argv[1]);
-      return ERROR(cmd);
+      return PR_ERROR(cmd);
     }
     else {
       off_t lStart = 0;
@@ -1250,7 +1250,7 @@ MODRET digest_cmdex(cmd_rec *cmd) {
 
         if (endp && *endp) {
           pr_response_add_err(R_501, "%s requires a startposition greater than or equal to 0", cmd->argv[0]);
-          return ERROR(cmd);
+          return PR_ERROR(cmd);
         }
 
 #ifdef HAVE_STRTOULL
@@ -1261,7 +1261,7 @@ MODRET digest_cmdex(cmd_rec *cmd) {
 
         if ( (endp && *endp)) {
           pr_response_add_err(R_501, "%s requires a endposition greater than 0", cmd->argv[0]);
-          return ERROR(cmd);
+          return PR_ERROR(cmd);
         }
       }
 
@@ -1270,7 +1270,7 @@ MODRET digest_cmdex(cmd_rec *cmd) {
 
       if(lStart >= lEnd) {
           pr_response_add_err(R_501, "%s requires endposition greater than startposition", cmd->argv[0]);
-          return ERROR(cmd);
+          return PR_ERROR(cmd);
       }
 
       lLength = lEnd - lStart;
@@ -1279,7 +1279,7 @@ MODRET digest_cmdex(cmd_rec *cmd) {
         && lLength > lMaxSize) {
         	// TODO: Should be replaced with R_556 once it has been defined in ftp.h
           pr_response_add_err("556", "%s: Length (%zu) greater than " CONFIG_DIGEST_MAXSIZE " (%zu) config value", cmd->arg, lLength, lMaxSize);
-          return ERROR(cmd);
+          return PR_ERROR(cmd);
       }
 
       if(strcmp(cmd->argv[0], C_XCRC) == 0)
@@ -1298,7 +1298,7 @@ MODRET digest_cmdex(cmd_rec *cmd) {
           pr_response_add(R_250, "%s", pszValue);
           // free(pszValue);
 
-          return HANDLED(cmd);
+          return PR_HANDLED(cmd);
         }
         else {
           /* TODO: More detailed error message? */
@@ -1308,7 +1308,7 @@ MODRET digest_cmdex(cmd_rec *cmd) {
       else {
         pr_response_add_err(R_550, "%s: No hash algorithm available", cmd->arg);
       }
-      return ERROR(cmd);
+      return PR_ERROR(cmd);
     }
   }
 }
@@ -1319,7 +1319,7 @@ MODRET digest_cmd(cmd_rec *cmd)
      Note: config name is the same as the command name.
    */
   if(!digest_isenabled(cmd->argv[0]))
-    return DECLINED(cmd);
+    return PR_DECLINED(cmd);
 
   return digest_cmdex(cmd);
 }
