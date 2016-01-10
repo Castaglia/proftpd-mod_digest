@@ -39,37 +39,56 @@ version is based.
 
 <h2>Directives</h2>
 <ul>
-  <li><a href="#DigestTypes">DigestTypes</a>
+  <li><a href="#DigestAlgorithms">DigestAlgorithms</a>
+  <li><a href="#DigestEngine">DigestEngine</a>
   <li><a href="#DigestMaxSize">DigestMaxSize</a>  	
 </ul>
 
 <hr>
-<h2><a name="DigestTypes">DigestTypes</a></h2>
-<strong>Syntax:</strong>DigestTypes <em>[ "crc32" | "md5" | "sha1" | "sha256" | "all" ]</em><br>
-<strong>Default:</strong> all<br>
-<strong>Context:</strong> server config, &lt;VirtualHost&gt;, &lt;Global&gt;, &lt;Anonymous&gt;<br>
+<h3><a name="DigestAlgorithms">DigestAlgorithms</a></h3>
+<strong>Syntax:</strong>DigestAlgorithms <em>["crc32"|"md5"|"sha1"|"sha256"|"all"]</em><br>
+<strong>Default:</strong>DigestAlgorithms all<br>
+<strong>Context:</strong>server config, &lt;VirtualHost&gt;, &lt;Global&gt;, &lt;Anonymous&gt;<br>
 <strong>Module:</strong> mod_digest<br>
-<strong>Compatibility:</strong> 1.3.3 or later
+<strong>Compatibility:</strong> 1.3.6rc2 or later
 
 <p>
-The <code>DigestTypes</code> directive configures the enabled digest/hash algorithms. If no <code>DigestTypes</code> directive is configured, then all digest algorithms are enabled. 
-Digest algorithms enabled are announced in the server FEAT reply. Following a list of digest types with the corresponding FTP command:<br>
-<table>
-	<tr><th>Digest Type</th><th>FTP Command</th></tr>
-	<tr><td>crc32</td><td>XCRC</td></tr>
-	<tr><td>md5</td><td>XMD5</td></tr>
-	<tr><td>sha1</td><td>XSHA1</td></tr>
-	<tr><td>sha256</td><td>XSHA256</td></tr>	
-	<tr><td>all</td><td>Enables all</td></tr>
-</table>
+The <code>DigestAlgorithms</code> directive configures the enabled digest
+algorithms.  If no <code>DigestAlgorithms</code> directive is configured, then
+<b>all</b> supported digest algorithms are enabled. 
 
+<p>
+Enabled digest algorithms are announced/discovered via the <code>FEAT</code>
+response.
+
+The following algorithms are currently supported by <code>mod_digest</code>:
+<ul>
+  <li><code>crc32</code> (<i>e.g.</i> for the <code>XCRC</code> command)
+  <li><code>md5</code> (<i>e.g.</i> for the <code>XMD5</code> command)
+  <li><code>sha1</code> (<i>e.g.</i> for the <code>XSHA1</code> command)
+  <li><code>sha256</code> (<i>e.g.</i> for the <code>XSHA256</code> command)
+</ul>
+
+<p>
 <hr>
-<h2><a name="DigestMaxSize">DigestMaxSize</a></h2>
-<strong>Syntax:</strong>DigestMaxSize <em>number</em><br>
-<strong>Default:</strong> unlimited<br>
-<strong>Context:</strong> server config, &lt;VirtualHost&gt;, &lt;Global&gt;, &lt;Anonymous&gt;<br>
+<h3><a name="DigestEngine">DigestEngine</a></h3>
+<strong>Syntax:</strong>DigestEngine <em>on|off</em><br>
+<strong>Default:</strong>DigestEngine on<br>
+<strong>Context:</strong>server config, &lt;VirtualHost&gt;, &lt;Global&gt;, &lt;Anonymous&gt;<br>
 <strong>Module:</strong> mod_digest<br>
-<strong>Compatibility:</strong> 1.3.3 or later
+<strong>Compatibility:</strong> 1.3.6rc2 or later
+
+<p>
+The <code>DigestEngine</code> directive
+
+<p>
+<hr>
+<h3><a name="DigestMaxSize">DigestMaxSize</a></h3>
+<strong>Syntax:</strong>DigestMaxSize <em>number</em><br>
+<strong>Default:</strong>None<br>
+<strong>Context:</strong>server config, &lt;VirtualHost&gt;, &lt;Global&gt;, &lt;Anonymous&gt;<br>
+<strong>Module:</strong> mod_digest<br>
+<strong>Compatibility:</strong> 1.3.6rc2 or later
 
 <p>
 The <code>DigestMaxSize</code> directive configures the maximum number of bytes a single hash command is allowed to read from a file.
@@ -80,15 +99,16 @@ If no <code>DigestMaxSize</code> directive is configured, then there is no limit
 <hr>
 <h2><a name="Installation">Installation</a></h2>
 To install <code>mod_digest</code>, copy the <code>mod_digest.c</code> file
-into <pre>
+into:
+<pre>
   <i>proftpd-dir</i>/contrib/
 </pre>
 Unpack the latest proftpd-1.3.<i>x</i> source code, then follow the
 usual steps for using third-party modules in proftpd:
 <pre>
-  ./configure --with-modules=mod_digest
-  make
-  make install
+  $ ./configure --with-modules=mod_digest
+  $ make
+  $ make install
 </pre>
 
 <p>
@@ -97,8 +117,8 @@ usual steps for using third-party modules in proftpd:
 Example Configuration
 <pre>
   &lt;IfModule mod_digest.c&gt;
-    DigestTypes all
-    DigestMaxSize 104857600 # 100MB
+    # Set a limit on file sizes that can be digested
+    DigestMaxSize 1GB
   &lt;/IfModule&gt;
 </pre>
 
@@ -106,7 +126,7 @@ Example Configuration
 <hr><br>
 
 <font size=2><b><i>
-&copy; Copyright <a href="http://www.smartftp.com">SmartFTP</a><br>
+&copy; Copyright 2016 TJ Saunders<br>
  All Rights Reserved<br>
 </i></b></font>
 
