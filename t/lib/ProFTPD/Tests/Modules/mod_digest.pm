@@ -39,6 +39,11 @@ my $TESTS = {
     test_class => [qw(forking)],
   },
 
+  digest_path_offset_length => {
+    order => ++$order,
+    test_class => [qw(forking)],
+  },
+
   digest_failed_enoent => {
     order => ++$order,
     test_class => [qw(forking)],
@@ -518,6 +523,124 @@ sub digest_xsha256 {
       my $client = ProFTPD::TestSuite::FTP->new('127.0.0.1', $port, 1);
       $client->login($setup->{user}, $setup->{passwd});
       my ($resp_code, $resp_msg) = $client->quote('XSHA256', 'test.txt');
+      $client->quit();
+
+      my $expected;
+
+      $expected = 250;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = $expected_digest;
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+    };
+
+    if ($@) {
+      $ex = $@;
+    }
+
+    $wfh->print("done\n");
+    $wfh->flush();
+
+  } else {
+    eval { server_wait($setup->{config_file}, $rfh) };
+    if ($@) {
+      warn($@);
+      exit 1;
+    }
+
+    exit 0;
+  }
+
+  # Stop server
+  server_stop($setup->{pid_file});
+  $self->assert_child_ok($pid);
+
+  test_cleanup($setup->{log_file}, $ex);
+}
+
+sub digest_path_offset_length {
+  my $self = shift;
+  my $tmpdir = $self->{tmpdir};
+  my $setup = test_setup($tmpdir, 'digest');
+
+  require Digest::CRC;
+
+  my $test_file = File::Spec->rel2abs("$tmpdir/test.txt");
+  if (open(my $fh, "> $test_file")) {
+    print $fh "Hello, World!\n";
+    unless (close($fh)) {
+      die("Can't write $test_file: $!");
+    }
+
+  } else {
+    die("Can't open $test_file: $!");
+  }
+
+  my $expected_digest;
+
+  if (open(my $fh, "< $test_file")) {
+    my $ctx = Digest::CRC->new(type => 'crc32');
+
+    my $buf;
+    unless (read($fh, $buf, 5)) {
+      die("Can't read $test_file: $!");
+    }
+
+    $ctx->add($buf);
+    $expected_digest = uc($ctx->hexdigest);
+    close($fh);
+
+  } else {
+    die("Can't read $test_file: $!");
+  }
+
+  my $config = {
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
+    Trace => 'digest:20',
+
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+
+    IfModules => {
+      'mod_delay.c' => {
+        DelayEngine => 'off',
+      },
+
+      'mod_digest.c' => {
+        DigestEngine => 'on',
+      },
+    },
+  };
+
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
+
+  # Open pipes, for use between the parent and child processes.  Specifically,
+  # the child will indicate when it's done with its test by writing a message
+  # to the parent.
+  my ($rfh, $wfh);
+  unless (pipe($rfh, $wfh)) {
+    die("Can't open pipe: $!");
+  }
+
+  my $ex;
+
+  # Fork child
+  $self->handle_sigchld();
+  defined(my $pid = fork()) or die("Can't fork: $!");
+  if ($pid) {
+    eval {
+      # Allow server to start up
+      sleep(1);
+
+      my $client = ProFTPD::TestSuite::FTP->new('127.0.0.1', $port, 1);
+      $client->login($setup->{user}, $setup->{passwd});
+      my ($resp_code, $resp_msg) = $client->quote('XCRC', 'test.txt', '0', '5');
       $client->quit();
 
       my $expected;

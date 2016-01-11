@@ -479,7 +479,7 @@ static int get_digest(pool *p, const char *path, off_t start, size_t len,
   pr_fh_t *fh;
   struct stat st;
   unsigned char *buf;
-  size_t bufsz;
+  size_t bufsz, readsz;
   EVP_MD_CTX md_ctx;
 
   fh = pr_fsio_open(path, O_RDONLY);
@@ -542,7 +542,13 @@ static int get_digest(pool *p, const char *path, off_t start, size_t len,
   }
 
   buf = palloc(p, bufsz);
-  res = pr_fsio_read(fh, (char *) buf, bufsz);
+
+  readsz = bufsz;
+  if (readsz > len) {
+    readsz = len;
+  }
+
+  res = pr_fsio_read(fh, (char *) buf, readsz);
   while (res > 0 && len > 0) {
     pr_signals_handle();
 
@@ -552,7 +558,13 @@ static int get_digest(pool *p, const char *path, off_t start, size_t len,
     }
 
     len -= res;
-    res = pr_fsio_read(fh, (char *) buf, bufsz);
+
+    readsz = bufsz;
+    if (readsz > len) {
+      readsz = len;
+    }
+
+    res = pr_fsio_read(fh, (char *) buf, readsz);
   }
 
   if (len != 0) {
@@ -662,15 +674,15 @@ MODRET digest_cmdex(cmd_rec *cmd) {
       }
     }
 
+    lLength = lEnd - lStart;
+
     pr_log_debug(DEBUG10, MOD_DIGEST_VERSION
-      ": '%s' Start=%llu, End=%llu", cmd->arg, (unsigned long long)lStart, (unsigned long long)lEnd);
+      ": '%s' Start=%llu, End=%llu, Length=%llu", cmd->arg, (unsigned long long)lStart, (unsigned long long)lEnd, (unsigned long long) lLength);
 
     if(lStart > lEnd) {
       pr_response_add_err(R_501, "%s requires endposition greater than startposition", (char *) cmd->argv[0]);
       return PR_ERROR(cmd);
     }
-
-    lLength = lEnd - lStart;
 
     if(digest_getmaxsize(&lMaxSize) == 1 && lLength > lMaxSize) {
       pr_response_add_err(R_556, "%s: Length (%zu) greater than DigestMaxSize (%zu) config value", cmd->arg, lLength, lMaxSize);
