@@ -70,9 +70,21 @@ static pool *digest_pool = NULL;
 
 /* Digest algorithms supported by mod_digest. */
 #define DIGEST_ALGO_CRC32		0x0001
-#define DIGEST_ALGO_MD5			0x0002
-#define DIGEST_ALGO_SHA1		0x0004
-#define DIGEST_ALGO_SHA256		0x0008
+#ifndef OPENSSL_NO_MD5
+# define DIGEST_ALGO_MD5		0x0002
+#else
+# define DIGEST_ALGO_MD5		0x0000
+#endif /* OPENSSL_NO_MD5 */
+#ifndef OPENSSL_NO_SHA
+# define DIGEST_ALGO_SHA1		0x0004
+#else
+# define DIGEST_ALGO_SHA1		0x0000
+#endif /* OPENSSL_NO_SHA */
+#ifndef OPENSSL_NO_SHA256
+# define DIGEST_ALGO_SHA256		0x0008
+#else
+# define DIGEST_ALGO_SHA256		0x0000
+#endif /* OPENSSL_NO_SHA256 */
 
 #define DIGEST_DEFAULT_ALGOS \
   (DIGEST_ALGO_CRC32|DIGEST_ALGO_MD5|DIGEST_ALGO_SHA1|DIGEST_ALGO_SHA256)
@@ -300,13 +312,25 @@ MODRET set_digestalgorithms(cmd_rec *cmd) {
         algos |= DIGEST_ALGO_CRC32;
 
       } else if (strcasecmp(cmd->argv[i], "md5") == 0) {
+#ifndef OPENSSL_NO_MD5
         algos |= DIGEST_ALGO_MD5;
+#else
+        CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "installed OpenSSL does not support '", cmd->argv[i], "' DigestAlgorithm", NULL));
+#endif /* OPENSSL_NO_MD5 */
 
       } else if (strcasecmp(cmd->argv[i], "sha1") == 0) {
+#ifndef OPENSSL_NO_SHA
         algos |= DIGEST_ALGO_SHA1;
+#else
+        CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "installed OpenSSL does not support '", cmd->argv[i], "' DigestAlgorithm", NULL));
+#endif /* OPENSSL_NO_SHA */
 
       } else if (strcasecmp(cmd->argv[i], "sha256") == 0) {
+#ifndef OPENSSL_NO_SHA256
         algos |= DIGEST_ALGO_SHA256;
+#else
+        CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "installed OpenSSL does not support '", cmd->argv[i], "' DigestAlgorithm", NULL));
+#endif /* OPENSSL_NO_SHA256 */
 
       } else {
         CONF_ERROR(cmd, pstrcat(cmd->tmp_pool,
