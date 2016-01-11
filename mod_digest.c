@@ -637,42 +637,105 @@ static int compute_digest(pool *p, const char *path, off_t start, size_t len,
   return 0;
 }
 
-static pr_table_t *get_cache(const EVP_MD *md) {
-  pr_table_t *cache = NULL;
+static const EVP_MD *get_algo_md(unsigned long algo) {
+  const EVP_MD *md = NULL;
 
-  switch (EVP_MD_type(md)) {
+  switch (algo) {
+    case DIGEST_ALGO_CRC32:
+      md = EVP_crc32();
+      break;
+
 #ifndef OPENSSL_NO_MD5
-    case NID_md5:
-      cache = digest_md5_tab;
+    case DIGEST_ALGO_MD5:
+      md = EVP_md5();
       break;
 #endif /* OPENSSL_NO_MD5 */
 
 #ifndef OPENSSL_NO_SHA1
-    case NID_sha1:
-      cache = digest_sha1_tab;
+    case DIGEST_ALGO_SHA1:
+      md = EVP_sha1();
       break;
 #endif /* OPENSSL_NO_SHA1 */
 
 #ifndef OPENSSL_NO_SHA256
-    case NID_sha256:
-      cache = digest_sha256_tab;
+    case DIGEST_ALGO_SHA256:
+      md = EVP_sha256();
       break;
 #endif /* OPENSSL_NO_SHA256 */
 
 #ifndef OPENSSL_NO_SHA512
-    case NID_sha512:
-      cache = digest_sha512_tab;
+    case DIGEST_ALGO_SHA512:
+      md = EVP_sha512();
       break;
 #endif /* OPENSSL_NO_SHA512 */
 
-    case NID_undef:
-      /* The "unknown" NID would be the custom CRC32 implementation. */
+    default:
+      errno = ENOENT;
+      break;
+  }
+
+  return md;
+}
+
+static const char *get_algo_name(unsigned long algo) {
+  const char *algo_name = "(unknown)";
+
+  switch (algo) {
+    case DIGEST_ALGO_CRC32:
+      algo_name = "CRC32";
+      break;
+
+    case DIGEST_ALGO_MD5:
+      algo_name = "MD5";
+      break;
+
+    case DIGEST_ALGO_SHA1:
+      algo_name = "SHA1";
+      break;
+
+    case DIGEST_ALGO_SHA256:
+      algo_name = "SHA256";
+      break;
+
+    case DIGEST_ALGO_SHA512:
+      algo_name = "SHA512";
+      break;
+
+    default:
+      errno = ENOENT;
+      break;
+  }
+
+  return algo_name;
+}
+
+static pr_table_t *get_cache(unsigned long algo) {
+  pr_table_t *cache = NULL;
+
+  switch (algo) {
+    case DIGEST_ALGO_CRC32:
       cache = digest_crc32_tab;
+      break;
+
+    case DIGEST_ALGO_MD5:
+      cache = digest_md5_tab;
+      break;
+
+    case DIGEST_ALGO_SHA1:
+      cache = digest_sha1_tab;
+      break;
+
+    case DIGEST_ALGO_SHA256:
+      cache = digest_sha256_tab;
+      break;
+
+    case DIGEST_ALGO_SHA512:
+      cache = digest_sha512_tab;
       break;
 
     default:
       pr_trace_msg(trace_channel, 4,
-        "unable to determine cache for %s digest", OBJ_nid2sn(EVP_MD_type(md)));
+        "unable to determine cache for %s digest", get_algo_name(algo));
       errno = EINVAL;
       return NULL;
   }
@@ -700,7 +763,7 @@ static const char *get_cache_key(pool *p, const char *path, off_t start,
   return key;
 }
 
-static char *get_cached_digest(pool *p, const EVP_MD *md, const char *path,
+static char *get_cached_digest(pool *p, unsigned long algo, const char *path,
     off_t start, size_t len) {
   const char *key;
   pr_table_t *cache;
@@ -712,7 +775,7 @@ static char *get_cached_digest(pool *p, const EVP_MD *md, const char *path,
     return NULL;
   }
 
-  cache = get_cache(md);
+  cache = get_cache(algo);
   if (cache == NULL) {
     return NULL;
   }
@@ -731,7 +794,7 @@ static char *get_cached_digest(pool *p, const EVP_MD *md, const char *path,
 
     pr_trace_msg(trace_channel, 12,
       "using cached digest '%s' for %s digest, key '%s'", hex_digest,
-      OBJ_nid2sn(EVP_MD_type(md)), key);
+      get_algo_name(algo), key);
     return hex_digest;
   }
 
@@ -739,7 +802,7 @@ static char *get_cached_digest(pool *p, const EVP_MD *md, const char *path,
   return NULL;
 }
 
-static int add_cached_digest(pool *p, const EVP_MD *md, const char *path,
+static int add_cached_digest(pool *p, unsigned long algo, const char *path,
     off_t start, size_t len, const char *hex_digest) {
   int res;
   const char *key;
@@ -749,7 +812,7 @@ static int add_cached_digest(pool *p, const EVP_MD *md, const char *path,
     return 0;
   }
 
-  cache = get_cache(md);
+  cache = get_cache(algo);
   if (cache == NULL) {
     return -1;
   }
@@ -764,20 +827,21 @@ static int add_cached_digest(pool *p, const EVP_MD *md, const char *path,
   if (res == 0) {
     pr_trace_msg(trace_channel, 12,
       "cached digest '%s' for %s digest, key '%s'", hex_digest,
-      OBJ_nid2sn(EVP_MD_type(md)), key);
+      get_algo_name(algo), key);
   }
 
   return res;
 }
 
-static char *get_digest(cmd_rec *cmd, const EVP_MD *md, const char *path,
+static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
     off_t start, size_t len, int flags) {
   int res;
+  const EVP_MD *md;
   unsigned char *digest = NULL;
   unsigned int digest_len;
   char *hex_digest;
 
-  hex_digest = get_cached_digest(cmd->tmp_pool, md, path, start, len);
+  hex_digest = get_cached_digest(cmd->tmp_pool, algo, path, start, len);
   if (hex_digest != NULL) {
     if (flags & PR_STR_FL_HEX_USE_UC) {
       register unsigned int i;
@@ -790,6 +854,7 @@ static char *get_digest(cmd_rec *cmd, const EVP_MD *md, const char *path,
     return hex_digest;
   }
 
+  md = get_algo_md(algo);
   digest_len = EVP_MD_size(md);
   digest = palloc(cmd->tmp_pool, digest_len);
 
@@ -800,7 +865,8 @@ static char *get_digest(cmd_rec *cmd, const EVP_MD *md, const char *path,
       PR_STR_FL_HEX_USE_LC);
   }
 
-  if (add_cached_digest(cmd->tmp_pool, md, path, start, len, hex_digest) < 0) {
+  if (add_cached_digest(cmd->tmp_pool, algo, path, start, len,
+      hex_digest) < 0) {
     pr_trace_msg(trace_channel, 8,
       "error caching %s digest for path '%s': %s", OBJ_nid2sn(EVP_MD_type(md)),
       path, strerror(errno));
@@ -858,7 +924,6 @@ MODRET digest_cmdex(cmd_rec *cmd, unsigned long algo) {
     off_t lEnd = 0;
     size_t lLength;
     size_t lMaxSize;
-    const EVP_MD *md = NULL;
 
     if(cmd->argc > 3) {
       char *endp = NULL;
@@ -901,42 +966,9 @@ MODRET digest_cmdex(cmd_rec *cmd, unsigned long algo) {
       return PR_ERROR(cmd);
     }
 
-    switch (algo) {
-      case DIGEST_ALGO_CRC32:
-        md = EVP_crc32();
-        break;
-
-#ifndef OPENSSL_NO_MD5
-      case DIGEST_ALGO_MD5:
-        md = EVP_md5();
-        break;
-#endif /* OPENSSL_NO_MD5 */
-
-#ifndef OPENSSL_NO_SHA1
-      case DIGEST_ALGO_SHA1:
-        md = EVP_sha1();
-        break;
-#endif /* OPENSSL_NO_SHA1 */
-
-#ifndef OPENSSL_NO_SHA256
-      case DIGEST_ALGO_SHA256:
-        md = EVP_sha256();
-        break;
-#endif /* OPENSSL_NO_SHA256 */
-
-#ifndef OPENSSL_NO_SHA512
-      case DIGEST_ALGO_SHA512:
-        md = EVP_sha512();
-        break;
-#endif /* OPENSSL_NO_SHA512 */
-
-      default:
-        break;
-    }
-
-    if(md) {
+    if (get_algo_md(algo) != NULL) {
       char *pszValue;
-      pszValue = get_digest(cmd, md, path, lStart, lLength,
+      pszValue = get_digest(cmd, algo, path, lStart, lLength,
         PR_STR_FL_HEX_USE_UC);
       if(pszValue) {
         pr_response_add(R_250, "%s", pszValue);
