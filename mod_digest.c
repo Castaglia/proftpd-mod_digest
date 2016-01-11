@@ -528,7 +528,8 @@ static int blacklisted_file(const char *path) {
 }
 
 static int compute_digest(pool *p, const char *path, off_t start, size_t len,
-    const EVP_MD *md, unsigned char *digest, unsigned int *digest_len) {
+    const EVP_MD *md, unsigned char *digest, unsigned int *digest_len,
+    time_t *mtime) {
   int res, xerrno = 0;
   pr_fh_t *fh;
   struct stat st;
@@ -570,6 +571,13 @@ static int compute_digest(pool *p, const char *path, off_t start, size_t len,
     (void) pr_fsio_close(fh);
     errno = xerrno;
     return -1;
+  }
+
+  if (mtime != NULL) {
+    /* Inform the caller of the last-mod-time for this file, for use in
+     * e.g caching.
+     */
+    *mtime = st.st_mtime;
   }
 
   /* Determine the optimal block size for reading. */
@@ -747,11 +755,16 @@ static pr_table_t *get_cache(unsigned long algo) {
   return cache;
 }
 
-/* Format the keys for the in-memory caches as: "<path>,<start>+<len>". */
-static const char *get_cache_key(pool *p, const char *path, off_t start,
-    size_t len) {
+/* Format the keys for the in-memory caches as:
+ *  "<path>@<mtime>,<start>+<len>"
+ */
+static const char *get_cache_key(pool *p, const char *path,
+    time_t mtime, off_t start, size_t len) {
   const char *key;
-  char start_str[256], len_str[256];
+  char mtime_str[256], start_str[256], len_str[256];
+
+  memset(mtime_str, '\0', sizeof(mtime_str));
+  snprintf(mtime_str, sizeof(mtime_str)-1, "%llu", (unsigned long long) mtime);
 
   memset(start_str, '\0', sizeof(start_str));
   snprintf(start_str, sizeof(start_str)-1, "%" PR_LU, (pr_off_t) start);
@@ -759,12 +772,12 @@ static const char *get_cache_key(pool *p, const char *path, off_t start,
   memset(len_str, '\0', sizeof(len_str));
   snprintf(len_str, sizeof(len_str)-1, "%llu", (unsigned long long) len);
 
-  key = pstrcat(p, path, ",", start_str, "+", len_str, NULL);
+  key = pstrcat(p, path, "@", mtime_str, ",", start_str, "+", len_str, NULL);
   return key;
 }
 
 static char *get_cached_digest(pool *p, unsigned long algo, const char *path,
-    off_t start, size_t len) {
+    time_t mtime, off_t start, size_t len) {
   const char *key;
   pr_table_t *cache;
   void *val;
@@ -780,7 +793,7 @@ static char *get_cached_digest(pool *p, unsigned long algo, const char *path,
     return NULL;
   }
 
-  key = get_cache_key(p, path, start, len);
+  key = get_cache_key(p, path, mtime, start, len);
   if (key == NULL) {
     return NULL;
   }
@@ -803,7 +816,7 @@ static char *get_cached_digest(pool *p, unsigned long algo, const char *path,
 }
 
 static int add_cached_digest(pool *p, unsigned long algo, const char *path,
-    off_t start, size_t len, const char *hex_digest) {
+    time_t mtime, off_t start, size_t len, const char *hex_digest) {
   int res;
   const char *key;
   pr_table_t *cache;
@@ -817,7 +830,7 @@ static int add_cached_digest(pool *p, unsigned long algo, const char *path,
     return -1;
   }
 
-  key = get_cache_key(p, path, start, len);
+  key = get_cache_key(p, path, mtime, start, len);
   if (key == NULL) {
     return -1;
   }
@@ -834,14 +847,14 @@ static int add_cached_digest(pool *p, unsigned long algo, const char *path,
 }
 
 static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
-    off_t start, size_t len, int flags) {
+    time_t mtime, off_t start, size_t len, int flags) {
   int res;
   const EVP_MD *md;
   unsigned char *digest = NULL;
   unsigned int digest_len;
   char *hex_digest;
 
-  hex_digest = get_cached_digest(cmd->tmp_pool, algo, path, start, len);
+  hex_digest = get_cached_digest(cmd->tmp_pool, algo, path, mtime, start, len);
   if (hex_digest != NULL) {
     if (flags & PR_STR_FL_HEX_USE_UC) {
       register unsigned int i;
@@ -859,13 +872,13 @@ static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
   digest = palloc(cmd->tmp_pool, digest_len);
 
   res = compute_digest(cmd->tmp_pool, path, start, len, md, digest,
-    &digest_len);
+    &digest_len, &mtime);
   if (res == 0) {
     hex_digest = pr_str_bin2hex(cmd->tmp_pool, digest, digest_len,
       PR_STR_FL_HEX_USE_LC);
   }
 
-  if (add_cached_digest(cmd->tmp_pool, algo, path, start, len,
+  if (add_cached_digest(cmd->tmp_pool, algo, path, mtime, start, len,
       hex_digest) < 0) {
     pr_trace_msg(trace_channel, 8,
       "error caching %s digest for path '%s': %s", OBJ_nid2sn(EVP_MD_type(md)),
@@ -885,7 +898,7 @@ static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
 
 MODRET digest_cmdex(cmd_rec *cmd, unsigned long algo) {
   char *path;
-  struct stat sbuf;
+  struct stat st;
 
   CHECK_CMD_MIN_ARGS(cmd, 2);
 
@@ -910,12 +923,12 @@ MODRET digest_cmdex(cmd_rec *cmd, unsigned long algo) {
 
   if (!path ||
       !dir_check(cmd->tmp_pool, cmd, cmd->group, path, NULL) ||
-      pr_fsio_stat(path, &sbuf) == -1) {
+      pr_fsio_stat(path, &st) == -1) {
     pr_response_add_err(R_550,"%s: %s", (char *) cmd->argv[1], strerror(errno));
     return PR_ERROR(cmd);
   }
 
-  if (!S_ISREG(sbuf.st_mode)) {
+  if (!S_ISREG(st.st_mode)) {
     pr_response_add_err(R_550,"%s: Not a regular file", (char *) cmd->argv[1]);
     return PR_ERROR(cmd);
 
@@ -968,7 +981,7 @@ MODRET digest_cmdex(cmd_rec *cmd, unsigned long algo) {
 
     if (get_algo_md(algo) != NULL) {
       char *pszValue;
-      pszValue = get_digest(cmd, algo, path, lStart, lLength,
+      pszValue = get_digest(cmd, algo, path, st.st_mtime, lStart, lLength,
         PR_STR_FL_HEX_USE_UC);
       if(pszValue) {
         pr_response_add(R_250, "%s", pszValue);
