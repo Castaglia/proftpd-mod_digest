@@ -39,6 +39,9 @@
 #ifndef C_XMD5
 # define C_XMD5		"XMD5"
 #endif
+#ifndef C_XSHA
+# define C_XSHA		"XSHA"
+#endif
 #ifndef C_XSHA1
 # define C_XSHA1	"XSHA1"
 #endif
@@ -603,9 +606,7 @@ static char *digest_calculatehash(cmd_rec *cmd, const EVP_MD *md,
   return hex_digest;
 }
 
-/* Command handlers
- */
-MODRET digest_cmdex(cmd_rec *cmd) {
+MODRET digest_cmdex(cmd_rec *cmd, unsigned long algo) {
   char *path;
   struct stat sbuf;
 
@@ -689,17 +690,25 @@ MODRET digest_cmdex(cmd_rec *cmd) {
       return PR_ERROR(cmd);
     }
 
-    if (strcmp(cmd->argv[0], C_XCRC) == 0) {
-      md = EVP_crc32();
+    switch (algo) {
+      case DIGEST_ALGO_CRC32:
+        md = EVP_crc32();
+        break;
 
-    } else if(strcmp(cmd->argv[0], C_XMD5) == 0) {
-      md = EVP_md5();
+      case DIGEST_ALGO_MD5:
+        md = EVP_md5();
+        break;
 
-    } else if(strcmp(cmd->argv[0], C_XSHA256) == 0) {
-      md = EVP_sha256();
+      case DIGEST_ALGO_SHA1:
+        md = EVP_sha1();
+        break;
 
-    } else if(strcmp(cmd->argv[0], C_XSHA1) == 0) {
-      md = EVP_sha1();
+      case DIGEST_ALGO_SHA256:
+        md = EVP_sha256();
+        break;
+
+      default:
+        break;
     }
 
     if(md) {
@@ -720,6 +729,9 @@ MODRET digest_cmdex(cmd_rec *cmd) {
 
   return PR_ERROR(cmd);
 }
+
+/* Command handlers
+ */
 
 MODRET digest_post_pass(cmd_rec *cmd) {
   config_rec *c;
@@ -746,47 +758,55 @@ MODRET digest_post_pass(cmd_rec *cmd) {
 }
 
 MODRET digest_xcrc(cmd_rec *cmd) {
-  if (digest_isenabled(DIGEST_ALGO_CRC32) != TRUE) {
+  unsigned long algo = DIGEST_ALGO_CRC32;
+
+  if (digest_isenabled(algo) != TRUE) {
     pr_log_debug(DEBUG9, MOD_DIGEST_VERSION
       ": unable to handle %s command: CRC32 disabled by DigestAlgorithms",
       (char *) cmd->argv[0]);
     return PR_DECLINED(cmd);
   }
 
-  return digest_cmdex(cmd);
+  return digest_cmdex(cmd, algo);
 }
 
 MODRET digest_xmd5(cmd_rec *cmd) {
-  if (digest_isenabled(DIGEST_ALGO_MD5) != TRUE) {
+  unsigned long algo = DIGEST_ALGO_MD5;
+
+  if (digest_isenabled(algo) != TRUE) {
     pr_log_debug(DEBUG9, MOD_DIGEST_VERSION
       ": unable to handle %s command: MD5 disabled by DigestAlgorithms",
       (char *) cmd->argv[0]);
     return PR_DECLINED(cmd);
   }
 
-  return digest_cmdex(cmd);
+  return digest_cmdex(cmd, algo);
 }
 
 MODRET digest_xsha1(cmd_rec *cmd) {
-  if (digest_isenabled(DIGEST_ALGO_SHA1) != TRUE) {
+  unsigned long algo = DIGEST_ALGO_SHA1;
+
+  if (digest_isenabled(algo) != TRUE) {
     pr_log_debug(DEBUG9, MOD_DIGEST_VERSION
       ": unable to handle %s command: SHA1 disabled by DigestAlgorithms",
       (char *) cmd->argv[0]);
     return PR_DECLINED(cmd);
   }
 
-  return digest_cmdex(cmd);
+  return digest_cmdex(cmd, algo);
 }
 
 MODRET digest_xsha256(cmd_rec *cmd) {
-  if (digest_isenabled(DIGEST_ALGO_SHA256) != TRUE) {
+  unsigned long algo = DIGEST_ALGO_SHA256;
+
+  if (digest_isenabled(algo) != TRUE) {
     pr_log_debug(DEBUG9, MOD_DIGEST_VERSION
       ": unable to handle %s command: SHA256 disabled by DigestAlgorithms",
       (char *) cmd->argv[0]);
     return PR_DECLINED(cmd);
   }
 
-  return digest_cmdex(cmd);
+  return digest_cmdex(cmd, algo);
 }
 
 /* Event listeners
@@ -865,6 +885,7 @@ static int digest_sess_init(void) {
 static cmdtable digest_cmdtab[] = {
   { CMD, C_XCRC,	G_READ, digest_xcrc,	TRUE, FALSE, CL_READ|CL_INFO },
   { CMD, C_XMD5,	G_READ, digest_xmd5,	TRUE, FALSE, CL_READ|CL_INFO },
+  { CMD, C_XSHA,	G_READ, digest_xsha1,	TRUE, FALSE, CL_READ|CL_INFO },
   { CMD, C_XSHA1,	G_READ, digest_xsha1,	TRUE, FALSE, CL_READ|CL_INFO },
   { CMD, C_XSHA256,	G_READ, digest_xsha256,	TRUE, FALSE, CL_READ|CL_INFO },
   { POST_CMD,	C_PASS, G_NONE,	digest_post_pass, TRUE, FALSE },

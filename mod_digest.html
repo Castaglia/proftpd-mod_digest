@@ -19,7 +19,7 @@ FTP commands:
 <ul>
   <li><code>XCRC</code> (requests CRC32 digest/checksum)
   <li><code>XMD5</code> (requests MD5 digest/checksum)
-  <li><code>XSHA1</code> (requests SHA1 digest/checksum)
+  <li><code>XSHA</code< <code>XSHA1</code> (requests SHA1 digest/checksum)
   <li><code>XSHA256</code> (requests SHA256 digest/checksum)
 </ul>
 
@@ -81,7 +81,7 @@ The following algorithms are currently supported by <code>mod_digest</code>:
 <ul>
   <li><code>crc32</code> (<i>e.g.</i> for the <code>XCRC</code> command)
   <li><code>md5</code> (<i>e.g.</i> for the <code>XMD5</code> command)
-  <li><code>sha1</code> (<i>e.g.</i> for the <code>XSHA1</code> command)
+  <li><code>sha1</code> (<i>e.g.</i> for the <code>XSHA</code>/<code>XSHA1</code> commands)
   <li><code>sha256</code> (<i>e.g.</i> for the <code>XSHA256</code> command)
 </ul>
 
@@ -100,6 +100,7 @@ the checksum-related FTP commands by <code>mod_digest</code>, <i>i.e.</i>:
 <ul>
   <li><code>XCRC</code>
   <li><code>XMD5</code>
+  <li><code>XSHA</code>
   <li><code>XSHA1</code>
   <li><code>XSHA256</code>
 </ul>
