@@ -51,8 +51,8 @@
 #endif
 
 /* Make sure the version of proftpd is as necessary. */
-#if PROFTPD_VERSION_NUMBER < 0x0001030602
-# error "ProFTPD 1.3.6rc2 or later required"
+#if PROFTPD_VERSION_NUMBER < 0x0001030304
+# error "ProFTPD 1.3.3 or later required"
 #endif
 
 #if !defined(HAVE_OPENSSL) && !defined(PR_USE_OPENSSL)
@@ -80,6 +80,50 @@ static pool *digest_pool = NULL;
 static unsigned long digest_algos = DIGEST_DEFAULT_ALGOS;
 
 static const char *trace_channel = "digest";
+
+#if PROFTPD_VERSION_NUMBER < 0x0001030602
+# define PR_STR_FL_HEX_USE_UC			0x0001
+# define PR_STR_FL_HEX_USE_LC			0x0002
+# define pr_str_bin2hex         		digest_bin2hex
+
+static char *digest_bin2hex(pool *p, const unsigned char *buf, size_len,
+    int flags) {
+  static const char *hex_lc = "0123456789abcdef", *hex_uc = "0123456789ABCDEF";
+  register unsigned int i;
+  const char *hex_vals;
+  char *hex, *ptr;
+  size_t hex_len;
+
+  if (p == NULL ||
+      buf == NULL) {
+    errno = EINVAL;
+    return NULL;
+  }
+
+  if (len == 0) {
+    return pstrdup(p, "");
+  }
+
+  /* By default, we use lowercase hex values. */
+  hex_vals = hex_lc;
+  if (flags & PR_STR_FL_HEX_USE_UC) {
+    hex_vals = hex_uc;
+  }
+
+
+  hex_len = (len * 2) + 1;
+  hex = palloc(p, hex_len);
+
+  ptr = hex;
+  for (i = 0; i < len; i++) {
+    *ptr++ = hex_vals[buf[i] >> 4];
+    *ptr++ = hex_vals[buf[i] % 16];
+  }
+  *ptr = '\0';
+
+  return hex;
+}
+#endif
 
 /* CRC32 implementation, as OpenSSL EVP_MD.  The following OpenSSL files
  * used as templates:
@@ -498,7 +542,7 @@ static char *digest_calculatehash(cmd_rec *cmd, const EVP_MD *md,
   res = get_digest(cmd->tmp_pool, pszFile, lStart, lLen, md, digest,
     &digest_len);
   if (res == 0) {
-    hex_digest = pr_str_hex(cmd->tmp_pool, digest, digest_len,
+    hex_digest = pr_str_bin2hex(cmd->tmp_pool, digest, digest_len,
       PR_STR_FL_HEX_USE_UC);
   }
 
