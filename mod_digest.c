@@ -73,6 +73,15 @@ module digest_module;
 
 static int digest_engine = TRUE;
 static pool *digest_pool = NULL;
+static unsigned long digest_opts = 0UL;
+#define DIGEST_OPT_NO_CACHE		0x0001
+
+/* Tables used as in-memory caches. */
+static pr_table_t *digest_crc32_tab = NULL;
+static pr_table_t *digest_md5_tab = NULL;
+static pr_table_t *digest_sha1_tab = NULL;
+static pr_table_t *digest_sha256_tab = NULL;
+static pr_table_t *digest_sha512_tab = NULL;
 
 /* Digest algorithms supported by mod_digest. */
 #define DIGEST_ALGO_CRC32		0x0001
@@ -410,8 +419,35 @@ MODRET set_digestmaxsize(cmd_rec *cmd) {
   return PR_HANDLED(cmd);
 }
 
-/* Command handlers
- */
+/* usage: DigestOptions opt1 ... */
+MODRET set_digestoptions(cmd_rec *cmd) {
+  config_rec *c = NULL;
+  register unsigned int i = 0;
+  unsigned long opts = 0UL;
+
+  if (cmd->argc-1 == 0) {
+    CONF_ERROR(cmd, "wrong number of parameters");
+  }
+
+  CHECK_CONF(cmd, CONF_ROOT|CONF_VIRTUAL|CONF_GLOBAL);
+
+  c = add_config_param(cmd->argv[0], 1, NULL);
+
+  for (i = 1; i < cmd->argc; i++) {
+    if (strcmp(cmd->argv[i], "NoCache") == 0) {
+      opts |= DIGEST_OPT_NO_CACHE;
+
+    } else {
+      CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, ": unknown DigestOption '",
+        cmd->argv[i], "'", NULL));
+    }
+  }
+
+  c->argv[0] = pcalloc(c->pool, sizeof(unsigned long));
+  *((unsigned long *) c->argv[0]) = opts;
+
+  return PR_HANDLED(cmd);
+}
 
 /* returns 1 if enabled. 0 otherwise */
 static int digest_isenabled(unsigned long algo) {
@@ -491,7 +527,7 @@ static int blacklisted_file(const char *path) {
   return res;
 }
 
-static int get_digest(pool *p, const char *path, off_t start, size_t len,
+static int compute_digest(pool *p, const char *path, off_t start, size_t len,
     const EVP_MD *md, unsigned char *digest, unsigned int *digest_len) {
   int res, xerrno = 0;
   pr_fh_t *fh;
@@ -601,21 +637,181 @@ static int get_digest(pool *p, const char *path, off_t start, size_t len,
   return 0;
 }
 
-static char *digest_calculatehash(cmd_rec *cmd, const EVP_MD *md,
-    const char *pszFile, off_t lStart, size_t lLen) {
+static pr_table_t *get_cache(const EVP_MD *md) {
+  pr_table_t *cache = NULL;
+
+  switch (EVP_MD_type(md)) {
+#ifndef OPENSSL_NO_MD5
+    case NID_md5:
+      cache = digest_md5_tab;
+      break;
+#endif /* OPENSSL_NO_MD5 */
+
+#ifndef OPENSSL_NO_SHA1
+    case NID_sha1:
+      cache = digest_sha1_tab;
+      break;
+#endif /* OPENSSL_NO_SHA1 */
+
+#ifndef OPENSSL_NO_SHA256
+    case NID_sha256:
+      cache = digest_sha256_tab;
+      break;
+#endif /* OPENSSL_NO_SHA256 */
+
+#ifndef OPENSSL_NO_SHA512
+    case NID_sha512:
+      cache = digest_sha512_tab;
+      break;
+#endif /* OPENSSL_NO_SHA512 */
+
+    case NID_undef:
+      /* The "unknown" NID would be the custom CRC32 implementation. */
+      cache = digest_crc32_tab;
+      break;
+
+    default:
+      pr_trace_msg(trace_channel, 4,
+        "unable to determine cache for %s digest", OBJ_nid2sn(EVP_MD_type(md)));
+      errno = EINVAL;
+      return NULL;
+  }
+
+  if (cache == NULL) {
+    errno = ENOENT;
+  }
+
+  return cache;
+}
+
+/* Format the keys for the in-memory caches as: "<path>,<start>+<len>". */
+static const char *get_cache_key(pool *p, const char *path, off_t start,
+    size_t len) {
+  const char *key;
+  char start_str[256], len_str[256];
+
+  memset(start_str, '\0', sizeof(start_str));
+  snprintf(start_str, sizeof(start_str)-1, "%" PR_LU, (pr_off_t) start);
+
+  memset(len_str, '\0', sizeof(len_str));
+  snprintf(len_str, sizeof(len_str)-1, "%llu", (unsigned long long) len);
+
+  key = pstrcat(p, path, ",", start_str, "+", len_str, NULL);
+  return key;
+}
+
+static char *get_cached_digest(pool *p, const EVP_MD *md, const char *path,
+    off_t start, size_t len) {
+  const char *key;
+  pr_table_t *cache;
+  void *val;
+  size_t valsz = 0;
+
+  if (digest_opts & DIGEST_OPT_NO_CACHE) {
+    errno = ENOENT;
+    return NULL;
+  }
+
+  cache = get_cache(md);
+  if (cache == NULL) {
+    return NULL;
+  }
+
+  key = get_cache_key(p, path, start, len);
+  if (key == NULL) {
+    return NULL;
+  }
+
+  val = pr_table_get(cache, key, &valsz);
+  if (val != NULL) {
+    char *hex_digest;
+
+    hex_digest = palloc(p, valsz);
+    memcpy(hex_digest, val, valsz);
+
+    pr_trace_msg(trace_channel, 12,
+      "using cached digest '%s' for %s digest, key '%s'", hex_digest,
+      OBJ_nid2sn(EVP_MD_type(md)), key);
+    return hex_digest;
+  }
+
+  errno = ENOENT;
+  return NULL;
+}
+
+static int add_cached_digest(pool *p, const EVP_MD *md, const char *path,
+    off_t start, size_t len, const char *hex_digest) {
+  int res;
+  const char *key;
+  pr_table_t *cache;
+
+  if (digest_opts & DIGEST_OPT_NO_CACHE) {
+    return 0;
+  }
+
+  cache = get_cache(md);
+  if (cache == NULL) {
+    return -1;
+  }
+
+  key = get_cache_key(p, path, start, len);
+  if (key == NULL) {
+    return -1;
+  }
+
+  res = pr_table_add_dup(cache, pstrdup(digest_pool, key),
+    (void *) hex_digest, 0);
+  if (res == 0) {
+    pr_trace_msg(trace_channel, 12,
+      "cached digest '%s' for %s digest, key '%s'", hex_digest,
+      OBJ_nid2sn(EVP_MD_type(md)), key);
+  }
+
+  return res;
+}
+
+static char *get_digest(cmd_rec *cmd, const EVP_MD *md, const char *path,
+    off_t start, size_t len, int flags) {
   int res;
   unsigned char *digest = NULL;
   unsigned int digest_len;
   char *hex_digest;
 
+  hex_digest = get_cached_digest(cmd->tmp_pool, md, path, start, len);
+  if (hex_digest != NULL) {
+    if (flags & PR_STR_FL_HEX_USE_UC) {
+      register unsigned int i;
+
+      for (i = 0; hex_digest[i]; i++) {
+        hex_digest[i] = toupper((int) hex_digest[i]);
+      }
+    }
+
+    return hex_digest;
+  }
+
   digest_len = EVP_MD_size(md);
   digest = palloc(cmd->tmp_pool, digest_len);
 
-  res = get_digest(cmd->tmp_pool, pszFile, lStart, lLen, md, digest,
+  res = compute_digest(cmd->tmp_pool, path, start, len, md, digest,
     &digest_len);
   if (res == 0) {
     hex_digest = pr_str_bin2hex(cmd->tmp_pool, digest, digest_len,
-      PR_STR_FL_HEX_USE_UC);
+      PR_STR_FL_HEX_USE_LC);
+  }
+
+  if (add_cached_digest(cmd->tmp_pool, md, path, start, len, hex_digest) < 0) {
+    pr_trace_msg(trace_channel, 8,
+      "error caching %s digest for path '%s': %s", OBJ_nid2sn(EVP_MD_type(md)),
+      path, strerror(errno));
+  }
+
+  if (flags & PR_STR_FL_HEX_USE_UC) {
+    register unsigned int i;
+
+    for (i = 0; hex_digest[i]; i++) {
+      hex_digest[i] = toupper((int) hex_digest[i]);
+    }
   }
 
   return hex_digest;
@@ -740,7 +936,8 @@ MODRET digest_cmdex(cmd_rec *cmd, unsigned long algo) {
 
     if(md) {
       char *pszValue;
-      pszValue = digest_calculatehash(cmd, md, path, lStart, lLength);
+      pszValue = get_digest(cmd, md, path, lStart, lLength,
+        PR_STR_FL_HEX_USE_UC);
       if(pszValue) {
         pr_response_add(R_250, "%s", pszValue);
         return PR_HANDLED(cmd);
@@ -896,24 +1093,52 @@ static int digest_sess_init(void) {
     digest_algos = *((unsigned long *) c->argv[0]);
   }
 
+  c = find_config(main_server->conf, CONF_PARAM, "DigestOptions", FALSE);
+  while (c != NULL) {
+    unsigned long opts = 0;
+
+    pr_signals_handle();
+
+    opts = *((unsigned long *) c->argv[0]);
+    digest_opts |= opts;
+
+    c = find_config_next(c, c->next, CONF_PARAM, "DigestOptions", FALSE);
+  }
+
+  if (!(digest_opts & DIGEST_OPT_NO_CACHE)) {
+    digest_crc32_tab = pr_table_alloc(digest_pool, 0);
+    digest_md5_tab = pr_table_alloc(digest_pool, 0);
+    digest_sha1_tab = pr_table_alloc(digest_pool, 0);
+    digest_sha256_tab = pr_table_alloc(digest_pool, 0);
+    digest_sha512_tab = pr_table_alloc(digest_pool, 0);
+  }
+
   if (digest_algos & DIGEST_ALGO_CRC32) {
     pr_feat_add(C_XCRC);
-    pr_help_add(C_XCRC, "<sp> pathname [<sp> startposition <sp> endposition]", TRUE);
+    pr_help_add(C_XCRC, "<sp> pathname [<sp> start <sp> end]", TRUE);
   }
 
   if (digest_algos & DIGEST_ALGO_MD5) {
     pr_feat_add(C_XMD5);
-    pr_help_add(C_XMD5, "<sp> pathname [<sp> startposition <sp> endposition]", TRUE);
+    pr_help_add(C_XMD5, "<sp> pathname [<sp> start <sp> end]", TRUE);
   }
 
   if (digest_algos & DIGEST_ALGO_SHA1) {
+    pr_feat_add(C_XSHA);
+    pr_help_add(C_XSHA, "<sp> pathname [<sp> start <sp> end]", TRUE);
+
     pr_feat_add(C_XSHA1);
-    pr_help_add(C_XSHA1, "<sp> pathname [<sp> startposition <sp> endposition]", TRUE);
+    pr_help_add(C_XSHA1, "<sp> pathname [<sp> start <sp> end]", TRUE);
   }
 
   if (digest_algos & DIGEST_ALGO_SHA256) {
     pr_feat_add(C_XSHA256);
     pr_help_add(C_XSHA256, "<sp> pathname [<sp> startposition <sp> endposition]", TRUE);
+  }
+
+  if (digest_algos & DIGEST_ALGO_SHA512) {
+    pr_feat_add(C_XSHA512);
+    pr_help_add(C_XSHA512, "<sp> pathname [<sp> startposition <sp> endposition]", TRUE);
   }
 
   return 0;
@@ -938,6 +1163,7 @@ static conftable digest_conftab[] = {
   { "DigestAlgorithms",	set_digestalgorithms,	NULL },
   { "DigestEngine",	set_digestengine,	NULL },
   { "DigestMaxSize",	set_digestmaxsize,	NULL },
+  { "DigestOptions",	set_digestoptions,	NULL },
 
   { NULL }
 };

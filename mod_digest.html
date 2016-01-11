@@ -59,6 +59,7 @@ version is based.
   <li><a href="#DigestAlgorithms">DigestAlgorithms</a>
   <li><a href="#DigestEngine">DigestEngine</a>
   <li><a href="#DigestMaxSize">DigestMaxSize</a>  	
+  <li><a href="#DigestOptions">DigestOptions</a>  	
 </ul>
 
 <hr>
@@ -122,6 +123,31 @@ If the parameter is <em>off</em>, then these commands will be ignored.
 The <code>DigestMaxSize</code> directive configures the maximum number of bytes a single hash command is allowed to read from a file.
 If the number of bytes to be read from the file is greater than the configured limit the server will return an error.
 If no <code>DigestMaxSize</code> directive is configured, then there is no limit. It is stronly recommended to set an upper limit.
+
+<p>
+<hr>
+<h3><a name="DigestOptions">DigestOptions</a></h3>
+<strong>Syntax:</strong> DigestOptions <em>opt1 ...</em><br>
+<strong>Default:</strong> None<br>
+<strong>Context:</strong> server config, <code>&lt;VirtualHost&gt;</code>, <code>&lt;Global&gt;</code><br>
+<strong>Module:</strong> mod_digest<br>
+<strong>Compatibility:</strong> 1.3.6rc2 and later
+
+<p>
+The <code>DigestOptions</code> directive is used to configure various optional
+behavior of <code>mod_digest</code>.
+
+<p>
+The currently implemented options are:
+<ul>
+  <li><code>NoCache</code><br>
+    <p>
+    The <code>mod_digest</code> module will cache the results of any
+    checksum command, on a per-file basis.  This improves performance, and
+    reduces computational overhead.  To disable this caching for any reason,
+    use this option.  <b>Not recommended.</b>
+  </li>
+</ul>
 
 <p>
 <hr>
