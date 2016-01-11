@@ -455,6 +455,24 @@ static int check_file(pool *p, const char *path, off_t start, size_t len,
   return 0;
 }
 
+/* Note that this is implemented in a case-INSENSITIVE manner, in order to
+ * protect any unfortunate case-insensitive filesystems (such as HFS on
+ * Mac, even though it is case-preserving).
+ */
+static int blacklisted_file(const char *path) {
+  int res = FALSE;
+
+  if (strncasecmp("/dev/full", path, 10) == 0 ||
+      strncasecmp("/dev/null", path, 10) == 0 ||
+      strncasecmp("/dev/random", path, 12) == 0 ||
+      strncasecmp("/dev/urandom", path, 13) == 0 ||
+      strncasecmp("/dev/zero", path, 10) == 0) {
+    res = TRUE;
+  }
+
+  return res;
+}
+
 static int get_digest(pool *p, const char *path, off_t start, size_t len,
     const EVP_MD *md, unsigned char *digest, unsigned int *digest_len) {
   int res, xerrno = 0;
@@ -587,7 +605,18 @@ MODRET digest_cmdex(cmd_rec *cmd) {
     return PR_ERROR((cmd));
   }
 
+  /* XXX Watch out for paths with spaces in them! */
   path = dir_realpath(cmd->tmp_pool, cmd->argv[1]);
+
+  if (path != NULL &&
+      blacklisted_file(path) == TRUE) {
+    pr_log_debug(DEBUG8, MOD_DIGEST_VERSION
+      ": rejecting request to checksum blacklisted special file '%s'", path);
+    pr_response_add_err(R_550, "%s: %s", (char *) cmd->arg, strerror(EPERM));
+    pr_cmd_set_errno(cmd, EPERM);
+    errno = EPERM;
+    return PR_ERROR(cmd);
+  }
 
   if (!path ||
       !dir_check(cmd->tmp_pool, cmd, cmd->group, path, NULL) ||
