@@ -71,10 +71,17 @@
 
 module digest_module;
 
+static int digest_caching = TRUE;
+
+#ifndef DIGEST_CACHE_DEFAULT_SIZE
+# define DIGEST_CACHE_DEFAULT_SIZE	10000
+#endif
+static size_t digest_cache_max_size = DIGEST_CACHE_DEFAULT_SIZE;
+
 static int digest_engine = TRUE;
 static pool *digest_pool = NULL;
 static unsigned long digest_opts = 0UL;
-#define DIGEST_OPT_NO_CACHE		0x0001
+#define DIGEST_OPT_NO_TRANSFER_CACHE		0x0001
 
 /* Tables used as in-memory caches. */
 static pr_table_t *digest_crc32_tab = NULL;
@@ -374,6 +381,44 @@ MODRET set_digestalgorithms(cmd_rec *cmd) {
   return PR_HANDLED(cmd);
 }
 
+/* usage: DigestCache on|off|size */
+MODRET set_digestcache(cmd_rec *cmd) {
+  config_rec *c;
+  int caching = -1;
+  size_t max_size = DIGEST_CACHE_DEFAULT_SIZE;
+
+  CHECK_ARGS(cmd, 1);
+  CHECK_CONF(cmd, CONF_ROOT|CONF_GLOBAL|CONF_VIRTUAL|CONF_ANON);
+
+  caching = get_boolean(cmd, 1);
+  if (caching == -1) {
+    long size;
+    char *ptr = NULL;
+
+    size = strtol(cmd->argv[1], &ptr, 10);
+    if (ptr && *ptr) {
+      CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "invalid cache size: ",
+        cmd->argv[1], NULL));
+    }
+
+    if (size < 1) {
+      CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "cache size must be > 0"));
+    }
+
+    caching = TRUE;
+    max_size = size;
+  }
+
+  c = add_config_param(cmd->argv[0], 2, NULL, NULL);
+  c->argv[0] = palloc(c->pool, sizeof(int));
+  *((int *) c->argv[0]) = caching;
+  c->argv[1] = palloc(c->pool, sizeof(size_t));
+  *((size_t *) c->argv[1]) = max_size;
+
+  c->flags |= CF_MERGEDOWN;
+  return PR_HANDLED(cmd);
+}
+
 /* usage: DigestEngine on|off */
 MODRET set_digestengine(cmd_rec *cmd) {
   int engine = -1;
@@ -434,8 +479,8 @@ MODRET set_digestoptions(cmd_rec *cmd) {
   c = add_config_param(cmd->argv[0], 1, NULL);
 
   for (i = 1; i < cmd->argc; i++) {
-    if (strcmp(cmd->argv[i], "NoCache") == 0) {
-      opts |= DIGEST_OPT_NO_CACHE;
+    if (strcmp(cmd->argv[i], "NoTransferCache") == 0) {
+      opts |= DIGEST_OPT_NO_TRANSFER_CACHE;
 
     } else {
       CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, ": unknown DigestOption '",
@@ -755,6 +800,42 @@ static pr_table_t *get_cache(unsigned long algo) {
   return cache;
 }
 
+static size_t get_cache_size(void) {
+  int res;
+  size_t cache_size = 0;
+
+  if (digest_caching == FALSE) {
+    return 0;
+  }
+
+  res = pr_table_count(digest_crc32_tab);
+  if (res >= 0) {
+    cache_size += res;
+  }
+
+  res = pr_table_count(digest_md5_tab);
+  if (res >= 0) {
+    cache_size += res;
+  }
+
+  res = pr_table_count(digest_sha1_tab);
+  if (res >= 0) {
+    cache_size += res;
+  }
+
+  res = pr_table_count(digest_sha256_tab);
+  if (res >= 0) {
+    cache_size += res;
+  }
+
+  res = pr_table_count(digest_sha512_tab);
+  if (res >= 0) {
+    cache_size += res;
+  }
+
+  return cache_size;
+}
+
 /* Format the keys for the in-memory caches as:
  *  "<path>@<mtime>,<start>+<len>"
  */
@@ -783,7 +864,7 @@ static char *get_cached_digest(pool *p, unsigned long algo, const char *path,
   void *val;
   size_t valsz = 0;
 
-  if (digest_opts & DIGEST_OPT_NO_CACHE) {
+  if (digest_caching == FALSE) {
     errno = ENOENT;
     return NULL;
   }
@@ -821,7 +902,7 @@ static int add_cached_digest(pool *p, unsigned long algo, const char *path,
   const char *key;
   pr_table_t *cache;
 
-  if (digest_opts & DIGEST_OPT_NO_CACHE) {
+  if (digest_caching == FALSE) {
     return 0;
   }
 
@@ -853,6 +934,28 @@ static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
   unsigned char *digest = NULL;
   unsigned int digest_len;
   char *hex_digest;
+  size_t cache_size;
+
+  /* Note: if caching is disabled, this condition will never be true. */
+  cache_size = get_cache_size();
+  if (cache_size >= digest_cache_max_size) {
+    int xerrno = EAGAIN;
+
+#ifdef EBUSY
+    /* This errno value may not be available on all platforms, but it is
+     * the most appropriate.
+     */
+    xerrno = EBUSY;
+#endif /* EBUSY */
+
+    pr_log_debug(DEBUG5, MOD_DIGEST_VERSION
+      ": cache size (%lu) meets/exceeds max cache size (%lu), "
+      "refusing %s command", (unsigned long) cache_size,
+      (unsigned long) digest_cache_max_size, (char *) cmd->argv[0]);
+
+    errno = xerrno;
+    return NULL;
+  }
 
   hex_digest = get_cached_digest(cmd->tmp_pool, algo, path, mtime, start, len);
   if (hex_digest != NULL) {
@@ -897,7 +1000,7 @@ static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
 }
 
 MODRET digest_cmdex(cmd_rec *cmd, unsigned long algo) {
-  char *path;
+  char *orig_path, *path;
   struct stat st;
 
   CHECK_CMD_MIN_ARGS(cmd, 2);
@@ -909,7 +1012,8 @@ MODRET digest_cmdex(cmd_rec *cmd, unsigned long algo) {
   }
 
   /* XXX Watch out for paths with spaces in them! */
-  path = dir_realpath(cmd->tmp_pool, cmd->argv[1]);
+  orig_path = cmd->argv[1];
+  path = dir_realpath(cmd->tmp_pool, orig_path);
 
   if (path != NULL &&
       blacklisted_file(path) == TRUE) {
@@ -980,19 +1084,32 @@ MODRET digest_cmdex(cmd_rec *cmd, unsigned long algo) {
     }
 
     if (get_algo_md(algo) != NULL) {
-      char *pszValue;
-      pszValue = get_digest(cmd, algo, path, st.st_mtime, lStart, lLength,
+      char *hex_digest, *error_code = R_550;
+
+      hex_digest = get_digest(cmd, algo, path, st.st_mtime, lStart, lLength,
         PR_STR_FL_HEX_USE_UC);
-      if(pszValue) {
-        pr_response_add(R_250, "%s", pszValue);
+      if (hex_digest != NULL) {
+        pr_response_add(R_250, "%s", hex_digest);
         return PR_HANDLED(cmd);
       }
 
+      if (errno == EAGAIN
+#ifdef EBUSY
+          || errno == EBUSY) {
+#endif
+        /* TODO: change this to pr_cmd_cmp(cmd, PR_CMD_HASH_ID) comparison */
+        if (pr_cmd_strcmp(cmd, "HASH") == 0) {
+          /* The HASH draft recommends using 450 for these cases. */
+          error_code = R_450;
+        }
+      }
+
       /* TODO: More detailed error message? */
-      pr_response_add_err(R_550, "%s: Failed to calculate hash", cmd->arg);
+      pr_response_add_err(error_code, "%s: %s", orig_path, strerror(errno));
 
     } else {
-      pr_response_add_err(R_550, "%s: No hash algorithm available", cmd->arg);
+      pr_response_add_err(R_550, _("%s: Hash algorithm not available"),
+        (char *) cmd->argv[0]);
     }
   }
 
@@ -1021,6 +1138,12 @@ MODRET digest_post_pass(cmd_rec *cmd) {
   c = find_config(CURRENT_CONF, CONF_PARAM, "DigestAlgorithms", FALSE);
   if (c != NULL) {
     digest_algos = *((unsigned long *) c->argv[0]);
+  }
+
+  c = find_config(CURRENT_CONF, CONF_PARAM, "DigestCache", FALSE);
+  if (c != NULL) {
+    digest_caching = *((int *) c->argv[0]);
+    digest_cache_max_size = *((size_t *) c->argv[1]);
   }
 
   return PR_DECLINED(cmd);
@@ -1138,6 +1261,12 @@ static int digest_sess_init(void) {
     digest_algos = *((unsigned long *) c->argv[0]);
   }
 
+  c = find_config(main_server->conf, CONF_PARAM, "DigestCache", FALSE);
+  if (c != NULL) {
+    digest_caching = *((int *) c->argv[0]);
+    digest_cache_max_size = *((size_t *) c->argv[1]);
+  }
+
   c = find_config(main_server->conf, CONF_PARAM, "DigestOptions", FALSE);
   while (c != NULL) {
     unsigned long opts = 0;
@@ -1150,7 +1279,7 @@ static int digest_sess_init(void) {
     c = find_config_next(c, c->next, CONF_PARAM, "DigestOptions", FALSE);
   }
 
-  if (!(digest_opts & DIGEST_OPT_NO_CACHE)) {
+  if (digest_caching == TRUE) {
     digest_crc32_tab = pr_table_alloc(digest_pool, 0);
     digest_md5_tab = pr_table_alloc(digest_pool, 0);
     digest_sha1_tab = pr_table_alloc(digest_pool, 0);
@@ -1206,6 +1335,7 @@ static cmdtable digest_cmdtab[] = {
 
 static conftable digest_conftab[] = {
   { "DigestAlgorithms",	set_digestalgorithms,	NULL },
+  { "DigestCache",	set_digestcache,	NULL },
   { "DigestEngine",	set_digestengine,	NULL },
   { "DigestMaxSize",	set_digestmaxsize,	NULL },
   { "DigestOptions",	set_digestoptions,	NULL },
