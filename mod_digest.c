@@ -48,6 +48,9 @@
 #ifndef C_XSHA256
 # define C_XSHA256	"XSHA256"
 #endif
+#ifndef C_XSHA512
+# define C_XSHA512	"XSHA512"
+#endif
 
 #ifndef R_556
 # define R_556		"556"
@@ -88,9 +91,14 @@ static pool *digest_pool = NULL;
 #else
 # define DIGEST_ALGO_SHA256		0x0000
 #endif /* OPENSSL_NO_SHA256 */
+#ifndef OPENSSL_NO_SHA512
+# define DIGEST_ALGO_SHA512		0x0010
+#else
+# define DIGEST_ALGO_SHA512		0x0000
+#endif /* OPENSSL_NO_SHA512 */
 
 #define DIGEST_DEFAULT_ALGOS \
-  (DIGEST_ALGO_CRC32|DIGEST_ALGO_MD5|DIGEST_ALGO_SHA1|DIGEST_ALGO_SHA256)
+  (DIGEST_ALGO_CRC32|DIGEST_ALGO_MD5|DIGEST_ALGO_SHA1|DIGEST_ALGO_SHA256|DIGEST_ALGO_SHA512)
 
 static unsigned long digest_algos = DIGEST_DEFAULT_ALGOS;
 
@@ -318,22 +326,29 @@ MODRET set_digestalgorithms(cmd_rec *cmd) {
 #ifndef OPENSSL_NO_MD5
         algos |= DIGEST_ALGO_MD5;
 #else
-        CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "installed OpenSSL does not support '", cmd->argv[i], "' DigestAlgorithm", NULL));
+        CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "installed OpenSSL does not support the '", cmd->argv[i], "' DigestAlgorithm", NULL));
 #endif /* OPENSSL_NO_MD5 */
 
       } else if (strcasecmp(cmd->argv[i], "sha1") == 0) {
 #ifndef OPENSSL_NO_SHA
         algos |= DIGEST_ALGO_SHA1;
 #else
-        CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "installed OpenSSL does not support '", cmd->argv[i], "' DigestAlgorithm", NULL));
+        CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "installed OpenSSL does not support the '", cmd->argv[i], "' DigestAlgorithm", NULL));
 #endif /* OPENSSL_NO_SHA */
 
       } else if (strcasecmp(cmd->argv[i], "sha256") == 0) {
 #ifndef OPENSSL_NO_SHA256
         algos |= DIGEST_ALGO_SHA256;
 #else
-        CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "installed OpenSSL does not support '", cmd->argv[i], "' DigestAlgorithm", NULL));
+        CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "installed OpenSSL does not support the '", cmd->argv[i], "' DigestAlgorithm", NULL));
 #endif /* OPENSSL_NO_SHA256 */
+
+      } else if (strcasecmp(cmd->argv[i], "sha512") == 0) {
+#ifndef OPENSSL_NO_SHA512
+        algos |= DIGEST_ALGO_SHA512;
+#else
+        CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "installed OpenSSL does not support the '", cmd->argv[i], "' DigestAlgorithm", NULL));
+#endif /* OPENSSL_NO_SHA512 */
 
       } else {
         CONF_ERROR(cmd, pstrcat(cmd->tmp_pool,
@@ -695,17 +710,29 @@ MODRET digest_cmdex(cmd_rec *cmd, unsigned long algo) {
         md = EVP_crc32();
         break;
 
+#ifndef OPENSSL_NO_MD5
       case DIGEST_ALGO_MD5:
         md = EVP_md5();
         break;
+#endif /* OPENSSL_NO_MD5 */
 
+#ifndef OPENSSL_NO_SHA1
       case DIGEST_ALGO_SHA1:
         md = EVP_sha1();
         break;
+#endif /* OPENSSL_NO_SHA1 */
 
+#ifndef OPENSSL_NO_SHA256
       case DIGEST_ALGO_SHA256:
         md = EVP_sha256();
         break;
+#endif /* OPENSSL_NO_SHA256 */
+
+#ifndef OPENSSL_NO_SHA512
+      case DIGEST_ALGO_SHA512:
+        md = EVP_sha512();
+        break;
+#endif /* OPENSSL_NO_SHA512 */
 
       default:
         break;
@@ -809,6 +836,19 @@ MODRET digest_xsha256(cmd_rec *cmd) {
   return digest_cmdex(cmd, algo);
 }
 
+MODRET digest_xsha512(cmd_rec *cmd) {
+  unsigned long algo = DIGEST_ALGO_SHA512;
+
+  if (digest_isenabled(algo) != TRUE) {
+    pr_log_debug(DEBUG9, MOD_DIGEST_VERSION
+      ": unable to handle %s command: SHA512 disabled by DigestAlgorithms",
+      (char *) cmd->argv[0]);
+    return PR_DECLINED(cmd);
+  }
+
+  return digest_cmdex(cmd, algo);
+}
+
 /* Event listeners
  */
 
@@ -888,6 +928,8 @@ static cmdtable digest_cmdtab[] = {
   { CMD, C_XSHA,	G_READ, digest_xsha1,	TRUE, FALSE, CL_READ|CL_INFO },
   { CMD, C_XSHA1,	G_READ, digest_xsha1,	TRUE, FALSE, CL_READ|CL_INFO },
   { CMD, C_XSHA256,	G_READ, digest_xsha256,	TRUE, FALSE, CL_READ|CL_INFO },
+  { CMD, C_XSHA512,	G_READ, digest_xsha512,	TRUE, FALSE, CL_READ|CL_INFO },
+
   { POST_CMD,	C_PASS, G_NONE,	digest_post_pass, TRUE, FALSE },
   { 0, NULL }
 };
