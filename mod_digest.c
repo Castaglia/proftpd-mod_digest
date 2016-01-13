@@ -717,7 +717,7 @@ static int blacklisted_file(const char *path) {
   return res;
 }
 
-static int compute_digest(pool *p, const char *path, off_t start, size_t len,
+static int compute_digest(pool *p, const char *path, off_t start, off_t len,
     const EVP_MD *md, unsigned char *digest, unsigned int *digest_len,
     time_t *mtime, void (*hash_progress_cb)(void)) {
   int res, xerrno = 0;
@@ -821,11 +821,15 @@ static int compute_digest(pool *p, const char *path, off_t start, size_t len,
     res = pr_fsio_read(fh, (char *) buf, readsz);
   }
 
-  if (len != 0) {
-    /* XXX How would this happen?  Premature EOF? */
-  }
-
   (void) pr_fsio_close(fh);
+
+  if (len != 0) {
+    pr_log_debug(DEBUG3, MOD_DIGEST_VERSION
+      ": failed to read all %" PR_LU " bytes of '%s' (premature EOF?)",
+      (pr_off_t) len, path);
+    errno = EIO;
+    return -1;
+  }
 
   if (EVP_DigestFinal_ex(&md_ctx, digest, digest_len) != 1) {
     pr_log_debug(DEBUG1, MOD_DIGEST_VERSION
