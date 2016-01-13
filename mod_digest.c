@@ -584,6 +584,11 @@ MODRET set_digestengine(cmd_rec *cmd) {
   CHECK_ARGS(cmd, 1);
   CHECK_CONF(cmd, CONF_ROOT|CONF_VIRTUAL|CONF_GLOBAL|CONF_ANON);
 
+  engine = get_boolean(cmd, 1);
+  if (engine == -1) {
+    CONF_ERROR(cmd, "expected Boolean parameter");
+  }
+
   c = add_config_param(cmd->argv[0], 1, NULL);
   c->argv[0] = palloc(c->pool, sizeof(int));
   *((int *) c->argv[0]) = engine;
@@ -652,15 +657,6 @@ MODRET set_digestoptions(cmd_rec *cmd) {
   *((unsigned long *) c->argv[0]) = opts;
 
   return PR_HANDLED(cmd);
-}
-
-/* returns 1 if enabled. 0 otherwise */
-static int digest_isenabled(unsigned long algo) {
-  if (digest_algos & algo) {
-    return TRUE;
-  }
-
-  return FALSE;
 }
 
 static int check_digest_max_size(off_t len) {
@@ -1971,7 +1967,11 @@ MODRET digest_post_pass(cmd_rec *cmd) {
 MODRET digest_xcrc(cmd_rec *cmd) {
   unsigned long algo = DIGEST_ALGO_CRC32;
 
-  if (digest_isenabled(algo) != TRUE) {
+  if (digest_engine == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (!(digest_algos & algo)) {
     pr_log_debug(DEBUG9, MOD_DIGEST_VERSION
       ": unable to handle %s command: CRC32 disabled by DigestAlgorithms",
       (char *) cmd->argv[0]);
@@ -1984,7 +1984,11 @@ MODRET digest_xcrc(cmd_rec *cmd) {
 MODRET digest_xmd5(cmd_rec *cmd) {
   unsigned long algo = DIGEST_ALGO_MD5;
 
-  if (digest_isenabled(algo) != TRUE) {
+  if (digest_engine == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (!(digest_algos & algo)) {
     pr_log_debug(DEBUG9, MOD_DIGEST_VERSION
       ": unable to handle %s command: MD5 disabled by DigestAlgorithms",
       (char *) cmd->argv[0]);
@@ -1997,7 +2001,11 @@ MODRET digest_xmd5(cmd_rec *cmd) {
 MODRET digest_xsha1(cmd_rec *cmd) {
   unsigned long algo = DIGEST_ALGO_SHA1;
 
-  if (digest_isenabled(algo) != TRUE) {
+  if (digest_engine == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (!(digest_algos & algo)) {
     pr_log_debug(DEBUG9, MOD_DIGEST_VERSION
       ": unable to handle %s command: SHA1 disabled by DigestAlgorithms",
       (char *) cmd->argv[0]);
@@ -2010,7 +2018,11 @@ MODRET digest_xsha1(cmd_rec *cmd) {
 MODRET digest_xsha256(cmd_rec *cmd) {
   unsigned long algo = DIGEST_ALGO_SHA256;
 
-  if (digest_isenabled(algo) != TRUE) {
+  if (digest_engine == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (!(digest_algos & algo)) {
     pr_log_debug(DEBUG9, MOD_DIGEST_VERSION
       ": unable to handle %s command: SHA256 disabled by DigestAlgorithms",
       (char *) cmd->argv[0]);
@@ -2023,7 +2035,11 @@ MODRET digest_xsha256(cmd_rec *cmd) {
 MODRET digest_xsha512(cmd_rec *cmd) {
   unsigned long algo = DIGEST_ALGO_SHA512;
 
-  if (digest_isenabled(algo) != TRUE) {
+  if (digest_engine == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (!(digest_algos & algo)) {
     pr_log_debug(DEBUG9, MOD_DIGEST_VERSION
       ": unable to handle %s command: SHA512 disabled by DigestAlgorithms",
       (char *) cmd->argv[0]);
