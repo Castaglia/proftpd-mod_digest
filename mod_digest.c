@@ -24,7 +24,6 @@
  * source distribution.
  *
  * -----DO NOT EDIT BELOW THIS LINE-----
- * $Archive: mod_digest.a$
  * $Libraries: -lcrypto$
  */
 
@@ -33,6 +32,9 @@
 #define MOD_DIGEST_VERSION      "mod_digest/2.0.0"
 
 /* Define the custom commands/responses used. */
+#ifndef C_HASH
+# define C_HASH		"HASH"
+#endif
 #ifndef C_XCRC
 # define C_XCRC		"XCRC"
 #endif
@@ -78,6 +80,8 @@ static int digest_caching = TRUE;
 #endif
 static size_t digest_cache_max_size = DIGEST_CACHE_DEFAULT_SIZE;
 
+static EVP_MD_CTX *digest_cache_xfer_ctx = NULL;
+
 static int digest_engine = TRUE;
 static pool *digest_pool = NULL;
 static unsigned long digest_opts = 0UL;
@@ -118,7 +122,16 @@ static pr_table_t *digest_sha512_tab = NULL;
 
 static unsigned long digest_algos = DIGEST_DEFAULT_ALGOS;
 
+static const EVP_MD *digest_hash_md = NULL;
+static unsigned long digest_hash_algo = DIGEST_ALGO_SHA1;
+
+/* Flags for determining the style of hash function names. */
+#define DIGEST_ALGO_FL_IANA_STYLE	0x0001
+
 static const char *trace_channel = "digest";
+
+/* Necessary prototypes. */
+static const char *get_algo_name(unsigned long algo, int flags);
 
 #if PROFTPD_VERSION_NUMBER < 0x0001030602
 # define PR_STR_FL_HEX_USE_UC			0x0001
@@ -313,6 +326,133 @@ static const char *get_errors(void) {
   return str;
 }
 
+static void digest_hash_feat_add(pool *p) {
+  char *feat_str = "";
+  int flags;
+
+  /* Per Draft, the hash function names should be those used in:
+   *  https://www.iana.org/assignments/hash-function-text-names/hash-function-text-names.txt
+   */
+  flags = DIGEST_ALGO_FL_IANA_STYLE;
+
+  if (digest_algos & DIGEST_ALGO_CRC32) {
+    int current_hash;
+
+    current_hash = (digest_hash_algo == DIGEST_ALGO_CRC32);
+    feat_str = pstrcat(p, *feat_str ? feat_str : "",
+      get_algo_name(DIGEST_ALGO_CRC32, flags), current_hash ? "*" : "", ";",
+      NULL);
+  }
+
+  if (digest_algos & DIGEST_ALGO_MD5) {
+    int current_hash;
+
+    current_hash = (digest_hash_algo == DIGEST_ALGO_MD5);
+    feat_str = pstrcat(p, *feat_str ? feat_str : "",
+      get_algo_name(DIGEST_ALGO_MD5, flags), current_hash ? "*" : "", ";",
+      NULL);
+  }
+
+  /* Note: What happens if SHA1 is disabled?  Need to properly mark, via
+   * asterisk, the next best default hash (can't be MD5 or CRC32).
+   */
+  if (digest_algos & DIGEST_ALGO_SHA1) {
+    int current_hash;
+
+    current_hash = (digest_hash_algo == DIGEST_ALGO_SHA1);
+    feat_str = pstrcat(p, *feat_str ? feat_str : "",
+      get_algo_name(DIGEST_ALGO_SHA1, flags), current_hash ? "*" : "", ";",
+      NULL);
+  }
+
+  if (digest_algos & DIGEST_ALGO_SHA256) {
+    int current_hash;
+
+    current_hash = (digest_hash_algo == DIGEST_ALGO_SHA256);
+    feat_str = pstrcat(p, *feat_str ? feat_str : "",
+      get_algo_name(DIGEST_ALGO_SHA256, flags), current_hash ? "*" : "", ";",
+      NULL);
+  }
+
+  if (digest_algos & DIGEST_ALGO_SHA512) {
+    int current_hash;
+
+    current_hash = (digest_hash_algo == DIGEST_ALGO_SHA512);
+    feat_str = pstrcat(p, *feat_str ? feat_str : "",
+      get_algo_name(DIGEST_ALGO_SHA512, flags), current_hash ? "*" : "", ";",
+      NULL);
+  }
+
+  feat_str = pstrcat(p, "HASH ", feat_str, NULL);
+  pr_feat_add(feat_str);
+}
+
+static void digest_hash_feat_remove(void) {
+  const char *feat, *hash_feat = NULL;
+
+  feat = pr_feat_get();
+  while (feat != NULL) {
+    pr_signals_handle();
+
+    if (strncmp(feat, C_HASH, 4) == 0) {
+      hash_feat = feat;
+      break;
+    }
+
+    feat = pr_feat_get_next();
+  }
+
+  if (hash_feat != NULL) {
+    pr_feat_remove(hash_feat);
+  }
+}
+
+static void digest_x_feat_add(pool *p) {
+  if (digest_algos & DIGEST_ALGO_CRC32) {
+    pr_feat_add(C_XCRC);
+  }
+
+  if (digest_algos & DIGEST_ALGO_MD5) {
+    pr_feat_add(C_XMD5);
+  }
+
+  if (digest_algos & DIGEST_ALGO_SHA1) {
+    pr_feat_add(C_XSHA);
+    pr_feat_add(C_XSHA1);
+  }
+
+  if (digest_algos & DIGEST_ALGO_SHA256) {
+    pr_feat_add(C_XSHA256);
+  }
+
+  if (digest_algos & DIGEST_ALGO_SHA512) {
+    pr_feat_add(C_XSHA512);
+  }
+}
+
+static void digest_x_help_add(pool *p) {
+  if (digest_algos & DIGEST_ALGO_CRC32) {
+    pr_help_add(C_XCRC, _("<sp> pathname [<sp> start <sp> end]"), TRUE);
+  }
+
+  if (digest_algos & DIGEST_ALGO_MD5) {
+    pr_help_add(C_XMD5, _("<sp> pathname [<sp> start <sp> end]"), TRUE);
+  }
+
+  if (digest_algos & DIGEST_ALGO_SHA1) {
+    pr_help_add(C_XSHA, _("<sp> pathname [<sp> start <sp> end]"), TRUE);
+    pr_help_add(C_XSHA1, _("<sp> pathname [<sp> start <sp> end]"), TRUE);
+  }
+
+  if (digest_algos & DIGEST_ALGO_SHA256) {
+    pr_help_add(C_XSHA256, _("<sp> pathname [<sp> start <sp> end]"), TRUE);
+  }
+
+  if (digest_algos & DIGEST_ALGO_SHA512) {
+    pr_help_add(C_XSHA512, _("<sp> pathname [<sp> start <sp> end]"), TRUE);
+  }
+}
+
 /* Configuration handlers
  */
 
@@ -438,27 +578,30 @@ MODRET set_digestengine(cmd_rec *cmd) {
 /* usage: DigestMaxSize len */
 MODRET set_digestmaxsize(cmd_rec *cmd) {
   config_rec *c = NULL;
-  char *endp = NULL;
-  size_t lValue;
+  char *ptr = NULL;
+  off_t max_size;
 
   CHECK_ARGS(cmd, 1);
   CHECK_CONF(cmd, CONF_ROOT|CONF_GLOBAL|CONF_VIRTUAL|CONF_ANON);
 
 #ifdef HAVE_STRTOULL
-  lValue = strtoull(cmd->argv[1], &endp, 10);
+  max_size = strtoull(cmd->argv[1], &ptr, 10);
 #else
-  lValue = strtoul(cmd->argv[1], &endp, 10);
+  max_size = strtoul(cmd->argv[1], &ptr, 10);
 #endif /* HAVE_STRTOULL */
 
-  if (endp && *endp)
-    CONF_ERROR(cmd, "requires a unsigned size_t value");
+  if (ptr && *ptr) {
+    CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "badly formatted size value: ",
+      cmd->argv[1], NULL));
+  }
 
-  if(lValue == 0)
+  if (max_size == 0) {
     CONF_ERROR(cmd, "requires a value greater than zero");
+  }
 
   c = add_config_param(cmd->argv[0], 1, NULL);
-  c->argv[0] = pcalloc(c->pool, sizeof(size_t));
-  *((size_t *) c->argv[0]) = lValue;
+  c->argv[0] = pcalloc(c->pool, sizeof(off_t));
+  *((off_t *) c->argv[0]) = max_size;
   c->flags |= CF_MERGEDOWN;
 
   return PR_HANDLED(cmd);
@@ -503,22 +646,26 @@ static int digest_isenabled(unsigned long algo) {
   return FALSE;
 }
 
-/* returns 1 if found. 0 otherwise */
-static int digest_getmaxsize(size_t *pValue)
-{
-  int nRet = 0;
-  config_rec *c = NULL;
+static int check_digest_max_size(off_t len) {
+  config_rec *c;
+  off_t max_size;
 
-  if(!pValue)
-    return 0;
-
-  /* Lookup config */
   c = find_config(CURRENT_CONF, CONF_PARAM, "DigestMaxSize", FALSE);
-  if(c) {
-    *pValue = *(size_t*)(c->argv[0]);
-    nRet = 1;
+  if (c == NULL) {
+    return 0;
   }
-  return nRet;
+
+  max_size = *((off_t *) c->argv[0]);
+
+  if (len > max_size) {
+    pr_log_debug(DEBUG5, MOD_DIGEST_VERSION
+      ": %s requested len (%" PR_LU ") exceeds DigestMaxSize %" PR_LU
+      ", rejecting", session.curr_cmd, (pr_off_t) len, (pr_off_t) max_size);
+    errno = EPERM;
+    return -1;
+  }
+
+  return 0;
 }
 
 static int check_file(pool *p, const char *path, off_t start, size_t len,
@@ -526,7 +673,7 @@ static int check_file(pool *p, const char *path, off_t start, size_t len,
 
   if (!S_ISREG(st->st_mode)) {
     pr_trace_msg(trace_channel, 2, "path '%s' is not a regular file", path);
-    errno = EINVAL;
+    errno = EISDIR;
     return -1;
   }
 
@@ -574,12 +721,12 @@ static int blacklisted_file(const char *path) {
 
 static int compute_digest(pool *p, const char *path, off_t start, size_t len,
     const EVP_MD *md, unsigned char *digest, unsigned int *digest_len,
-    time_t *mtime) {
+    time_t *mtime, void (*hash_progress_cb)(void)) {
   int res, xerrno = 0;
   pr_fh_t *fh;
   struct stat st;
   unsigned char *buf;
-  size_t bufsz, readsz;
+  size_t bufsz, readsz, iter_count;
   EVP_MD_CTX md_ctx;
 
   fh = pr_fsio_open(path, O_RDONLY);
@@ -603,11 +750,6 @@ static int compute_digest(pool *p, const char *path, off_t start, size_t len,
 
     errno = xerrno;
     return -1;
-  }
-
-  if (len == 0) {
-    /* Automatically calculate the appropriate length. */
-    len = (st.st_size - start);
   }
 
   res = check_file(p, path, start, len, &st);
@@ -655,9 +797,11 @@ static int compute_digest(pool *p, const char *path, off_t start, size_t len,
     readsz = len;
   }
 
+  iter_count = 0;
   res = pr_fsio_read(fh, (char *) buf, readsz);
   while (res > 0 && len > 0) {
     pr_signals_handle();
+    iter_count++;
 
     if (EVP_DigestUpdate(&md_ctx, buf, res) != 1) {
       pr_log_debug(DEBUG1, MOD_DIGEST_VERSION
@@ -665,6 +809,11 @@ static int compute_digest(pool *p, const char *path, off_t start, size_t len,
     }
 
     len -= res;
+
+    /* Every Nth iteration, invoke the progress callback. */
+    if (iter_count & 10000) {
+      (hash_progress_cb)();
+    }
 
     readsz = bufsz;
     if (readsz > len) {
@@ -730,7 +879,7 @@ static const EVP_MD *get_algo_md(unsigned long algo) {
   return md;
 }
 
-static const char *get_algo_name(unsigned long algo) {
+static const char *get_algo_name(unsigned long algo, int flags) {
   const char *algo_name = "(unknown)";
 
   switch (algo) {
@@ -743,15 +892,30 @@ static const char *get_algo_name(unsigned long algo) {
       break;
 
     case DIGEST_ALGO_SHA1:
-      algo_name = "SHA1";
+      if (flags & DIGEST_ALGO_FL_IANA_STYLE) {
+        algo_name = "SHA-1";
+
+      } else {
+        algo_name = "SHA1";
+      }
       break;
 
     case DIGEST_ALGO_SHA256:
-      algo_name = "SHA256";
+      if (flags & DIGEST_ALGO_FL_IANA_STYLE) {
+        algo_name = "SHA-256";
+
+      } else {
+        algo_name = "SHA256";
+      }
       break;
 
     case DIGEST_ALGO_SHA512:
-      algo_name = "SHA512";
+      if (flags & DIGEST_ALGO_FL_IANA_STYLE) {
+        algo_name = "SHA-512";
+
+      } else {
+        algo_name = "SHA512";
+      }
       break;
 
     default:
@@ -788,7 +952,7 @@ static pr_table_t *get_cache(unsigned long algo) {
 
     default:
       pr_trace_msg(trace_channel, 4,
-        "unable to determine cache for %s digest", get_algo_name(algo));
+        "unable to determine cache for %s digest", get_algo_name(algo, 0));
       errno = EINVAL;
       return NULL;
   }
@@ -888,7 +1052,7 @@ static char *get_cached_digest(pool *p, unsigned long algo, const char *path,
 
     pr_trace_msg(trace_channel, 12,
       "using cached digest '%s' for %s digest, key '%s'", hex_digest,
-      get_algo_name(algo), key);
+      get_algo_name(algo, 0), key);
     return hex_digest;
   }
 
@@ -921,14 +1085,15 @@ static int add_cached_digest(pool *p, unsigned long algo, const char *path,
   if (res == 0) {
     pr_trace_msg(trace_channel, 12,
       "cached digest '%s' for %s digest, key '%s'", hex_digest,
-      get_algo_name(algo), key);
+      get_algo_name(algo, 0), key);
   }
 
   return res;
 }
 
 static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
-    time_t mtime, off_t start, size_t len, int flags) {
+    time_t mtime, off_t start, size_t len, int flags,
+    void (*hash_progress_cb)(void)) {
   int res;
   const EVP_MD *md;
   unsigned char *digest = NULL;
@@ -975,7 +1140,7 @@ static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
   digest = palloc(cmd->tmp_pool, digest_len);
 
   res = compute_digest(cmd->tmp_pool, path, start, len, md, digest,
-    &digest_len, &mtime);
+    &digest_len, &mtime, hash_progress_cb);
   if (res == 0) {
     hex_digest = pr_str_bin2hex(cmd->tmp_pool, digest, digest_len,
       PR_STR_FL_HEX_USE_LC);
@@ -999,24 +1164,39 @@ static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
   return hex_digest;
 }
 
-MODRET digest_cmdex(cmd_rec *cmd, unsigned long algo) {
+static void digest_progress_cb(void) {
+  pr_response_add(R_DUP, _("Calculating..."));
+}
+
+static modret_t *digest_xcmd(cmd_rec *cmd, unsigned long algo) {
   char *orig_path, *path;
   struct stat st;
 
   CHECK_CMD_MIN_ARGS(cmd, 2);
 
-  /* Note: no support for "CMD file endposition" because it's implemented differently by other FTP servers */
-  if(cmd->argc == 3) {
-    pr_response_add_err(R_501, "Invalid number of arguments.");
+  /* Note: no support for "XCMD path end" because it's implemented differently
+   * by other FTP servers, and is ambiguous (is the 'end' number the end, or
+   * the start, or...?).
+   */
+  if (cmd->argc == 3) {
+    pr_response_add_err(R_501, _("Invalid number of arguments"));
     return PR_ERROR((cmd));
   }
 
   /* XXX Watch out for paths with spaces in them! */
   orig_path = cmd->argv[1];
   path = dir_realpath(cmd->tmp_pool, orig_path);
+  if (path == NULL) {
+    int xerrno = errno;
 
-  if (path != NULL &&
-      blacklisted_file(path) == TRUE) {
+    pr_response_add_err(R_550, "%s: %s", orig_path, strerror(xerrno));
+
+    pr_cmd_set_errno(cmd, xerrno);
+    errno = xerrno;
+    return PR_ERROR(cmd);
+  }
+
+  if (blacklisted_file(path) == TRUE) {
     pr_log_debug(DEBUG8, MOD_DIGEST_VERSION
       ": rejecting request to checksum blacklisted special file '%s'", path);
     pr_response_add_err(R_550, "%s: %s", (char *) cmd->arg, strerror(EPERM));
@@ -1025,87 +1205,103 @@ MODRET digest_cmdex(cmd_rec *cmd, unsigned long algo) {
     return PR_ERROR(cmd);
   }
 
-  if (!path ||
-      !dir_check(cmd->tmp_pool, cmd, cmd->group, path, NULL) ||
-      pr_fsio_stat(path, &st) == -1) {
-    pr_response_add_err(R_550,"%s: %s", (char *) cmd->argv[1], strerror(errno));
+  if (!dir_check(cmd->tmp_pool, cmd, cmd->group, path, NULL)) {
+    int xerrno = EPERM;
+
+    pr_log_debug(DEBUG8, MOD_DIGEST_VERSION
+      ": %s denied by <Limit> configuration", (char *) cmd->argv[0]);
+    pr_response_add_err(R_550, "%s: %s", orig_path, strerror(xerrno));
+
+    pr_cmd_set_errno(cmd, xerrno);
+    errno = xerrno;
+    return PR_ERROR(cmd);
+  }
+
+  pr_fs_clear_cache2(path);
+  if (pr_fsio_stat(path, &st) < 0) {
+    int xerrno = errno;
+
+    pr_response_add_err(R_550, "%s: %s", orig_path, strerror(xerrno));
+
+    pr_cmd_set_errno(cmd, xerrno);
+    errno = xerrno;
     return PR_ERROR(cmd);
   }
 
   if (!S_ISREG(st.st_mode)) {
-    pr_response_add_err(R_550,"%s: Not a regular file", (char *) cmd->argv[1]);
+    pr_log_debug(DEBUG5, MOD_DIGEST_VERSION
+      ": unable to handle %s for non-file path '%s'", (char *) cmd->argv[0],
+      path);
+    pr_response_add_err(R_550, _("%s: Not a regular file"), orig_path);
     return PR_ERROR(cmd);
 
   } else {
-    off_t lStart = 0;
-    off_t lEnd = 0;
-    size_t lLength;
-    size_t lMaxSize;
+    off_t len, start_pos = 0, end_pos = 0;
 
-    if(cmd->argc > 3) {
-      char *endp = NULL;
+    if (cmd->argc > 3) {
+      char *ptr = NULL;
 
 #ifdef HAVE_STRTOULL
-      lStart = strtoull(cmd->argv[2], &endp, 10);
+      start_pos = strtoull(cmd->argv[2], &ptr, 10);
 #else
-      lStart = strtoul(cmd->argv[2], &endp, 10);
+      start_pos = strtoul(cmd->argv[2], &ptr, 10);
 #endif /* HAVE_STRTOULL */
 
-      if (endp && *endp) {
-        pr_response_add_err(R_501, "%s requires a startposition greater than or equal to 0", (char *) cmd->argv[0]);
+      if (ptr && *ptr) {
+        pr_response_add_err(R_501,
+          _("%s requires a start greater than or equal to 0"),
+          (char *) cmd->argv[0]);
         return PR_ERROR(cmd);
       }
 
+      ptr = NULL;
 #ifdef HAVE_STRTOULL
-      lEnd = strtoull(cmd->argv[3], &endp, 10);
+      end_pos = strtoull(cmd->argv[3], &ptr, 10);
 #else
-      lEnd = strtoul(cmd->argv[3], &endp, 10);
+      end_pos = strtoul(cmd->argv[3], &ptr, 10);
 #endif /* HAVE_STRTOULL */
 
-      if ( (endp && *endp)) {
-        pr_response_add_err(R_501, "%s requires a endposition greater than 0", (char *) cmd->argv[0]);
+      if (ptr && *ptr) {
+        pr_response_add_err(R_501,
+          _("%s requires an end greater than 0"), (char *) cmd->argv[0]);
         return PR_ERROR(cmd);
       }
     }
 
-    lLength = lEnd - lStart;
+    len = end_pos - start_pos;
 
     pr_log_debug(DEBUG10, MOD_DIGEST_VERSION
-      ": '%s' Start=%llu, End=%llu, Length=%llu", cmd->arg, (unsigned long long)lStart, (unsigned long long)lEnd, (unsigned long long) lLength);
+      ": '%s' start=%" PR_LU ", end=%" PR_LU ", len=%" PR_LU, cmd->arg,
+      (pr_off_t) start_pos, (pr_off_t) end_pos, (pr_off_t) len);
 
-    if(lStart > lEnd) {
-      pr_response_add_err(R_501, "%s requires endposition greater than startposition", (char *) cmd->argv[0]);
+    if (start_pos > end_pos) {
+      pr_response_add_err(R_501,
+        _("%s requires end (%" PR_LU ") greater than start (%" PR_LU ")"),
+        (char *) cmd->argv[0], (pr_off_t) end_pos, (pr_off_t) end_pos);
       return PR_ERROR(cmd);
     }
 
-    if(digest_getmaxsize(&lMaxSize) == 1 && lLength > lMaxSize) {
-      pr_response_add_err(R_556, "%s: Length (%zu) greater than DigestMaxSize (%zu) config value", cmd->arg, lLength, lMaxSize);
+    if (check_digest_max_size(len) < 0) {
+      pr_response_add_err(R_550,
+       _("%s: Requested length (%" PR_LU ") exceeds site policy"),
+       (char *) cmd->argv[0], (pr_off_t) len);
       return PR_ERROR(cmd);
     }
 
     if (get_algo_md(algo) != NULL) {
-      char *hex_digest, *error_code = R_550;
+      char *hex_digest;
 
-      hex_digest = get_digest(cmd, algo, path, st.st_mtime, lStart, lLength,
-        PR_STR_FL_HEX_USE_UC);
+      pr_response_add(R_250, _("%s: Calculating %s digest"),
+        (char *) cmd->argv[0], get_algo_name(algo, 0));
+      hex_digest = get_digest(cmd, algo, path, st.st_mtime, start_pos, len,
+        PR_STR_FL_HEX_USE_UC, digest_progress_cb);
       if (hex_digest != NULL) {
-        pr_response_add(R_250, "%s", hex_digest);
+        pr_response_add(R_DUP, "%s", hex_digest);
         return PR_HANDLED(cmd);
       }
 
-      if (errno == EAGAIN
-#ifdef EBUSY
-          || errno == EBUSY) {
-#endif
-        /* TODO: change this to pr_cmd_cmp(cmd, PR_CMD_HASH_ID) comparison */
-        if (pr_cmd_strcmp(cmd, "HASH") == 0) {
-          /* The HASH draft recommends using 450 for these cases. */
-          error_code = R_450;
-        }
-      }
-
       /* TODO: More detailed error message? */
-      pr_response_add_err(error_code, "%s: %s", orig_path, strerror(errno));
+      pr_response_add_err(R_550, "%s: %s", orig_path, strerror(errno));
 
     } else {
       pr_response_add_err(R_550, _("%s: Hash algorithm not available"),
@@ -1118,6 +1314,304 @@ MODRET digest_cmdex(cmd_rec *cmd, unsigned long algo) {
 
 /* Command handlers
  */
+
+MODRET digest_hash(cmd_rec *cmd) {
+  int xerrno = 0;
+  char *error_code = NULL, *orig_path = NULL, *path = NULL, *hex_digest = NULL;
+  struct stat st;
+  off_t len, start_pos, end_pos;
+
+  if (digest_engine == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  CHECK_CMD_MIN_ARGS(cmd, 2);
+
+  orig_path = pr_fs_decode_path(cmd->tmp_pool, cmd->arg);
+  path = dir_realpath(cmd->tmp_pool, orig_path);
+  if (path == NULL) {
+    xerrno = errno;
+
+    pr_response_add_err(R_550, "%s: %s", orig_path, strerror(xerrno));
+
+    pr_cmd_set_errno(cmd, xerrno);
+    errno = xerrno;
+    return PR_ERROR(cmd);
+  }
+
+  if (blacklisted_file(path) == TRUE) {
+    pr_log_debug(DEBUG8, MOD_DIGEST_VERSION
+      ": rejecting request to checksum blacklisted special file '%s'", path);
+    pr_response_add_err(R_556, "%s: %s", (char *) cmd->arg, strerror(EPERM));
+    pr_cmd_set_errno(cmd, EPERM);
+    errno = EPERM;
+    return PR_ERROR(cmd);
+  }
+
+  if (!dir_check(cmd->tmp_pool, cmd, cmd->group, path, NULL)) {
+    xerrno = EPERM;
+
+    pr_log_debug(DEBUG8, MOD_DIGEST_VERSION
+      ": %s denied by <Limit> configuration", (char *) cmd->argv[0]);
+    pr_response_add_err(R_552, "%s: %s", orig_path, strerror(xerrno));
+
+    pr_cmd_set_errno(cmd, xerrno);
+    errno = xerrno;
+    return PR_ERROR(cmd);
+  }
+
+  pr_fs_clear_cache2(path);
+  if (pr_fsio_stat(path, &st) < 0) {
+    xerrno = errno;
+
+    pr_response_add_err(R_550, "%s: %s", orig_path, strerror(xerrno));
+
+    pr_cmd_set_errno(cmd, xerrno);
+    errno = xerrno;
+    return PR_ERROR(cmd);
+  }
+
+  if (!S_ISREG(st.st_mode)) {
+    pr_log_debug(DEBUG5, MOD_DIGEST_VERSION
+      ": unable to handle %s for non-file path '%s'", (char *) cmd->argv[0],
+      path);
+    pr_response_add_err(R_553, _("%s: Not a regular file"), orig_path);
+    return PR_ERROR(cmd);
+  }
+
+  start_pos = 0;
+  end_pos = st.st_size;
+  len = end_pos - start_pos;
+
+  if (check_digest_max_size(len) < 0) {
+    pr_response_add_err(R_556,
+     _("%s: Requested length (%" PR_LU ") exceeds site policy"),
+     (char *) cmd->argv[0], (pr_off_t) len);
+    return PR_ERROR(cmd);
+  }
+
+  pr_trace_msg(trace_channel, 14,
+    "%s: using %s algorithm on path '%s', mtime = %lu, start_pos = %" PR_LU
+    ", end_pos = %" PR_LU, (char *) cmd->argv[0],
+    get_algo_name(digest_hash_algo, 0), path, (unsigned long) st.st_mtime,
+    (pr_off_t) start_pos, (pr_off_t) end_pos);
+
+  pr_response_add(R_213, _("%s: Calculating %s digest"), (char *) cmd->argv[0],
+    get_algo_name(digest_hash_algo, DIGEST_ALGO_FL_IANA_STYLE));
+  hex_digest = get_digest(cmd, digest_hash_algo, path, st.st_mtime, start_pos,
+    len, PR_STR_FL_HEX_USE_LC, digest_progress_cb);
+  xerrno = errno;
+
+  if (hex_digest != NULL) {
+    pr_response_add(R_DUP, "%s %" PR_LU "-%" PR_LU " %s %s",
+      get_algo_name(digest_hash_algo, DIGEST_ALGO_FL_IANA_STYLE),
+      (pr_off_t) start_pos, (pr_off_t) end_pos, hex_digest, orig_path);
+    return PR_HANDLED(cmd);
+  }
+
+  switch (xerrno) {
+#ifdef EBUSY
+    case EBUSY:
+#endif
+    case EAGAIN:
+      /* The HASH draft recommends using 450 for these cases. */
+      error_code = R_450;
+      break;
+
+    default:
+      error_code = R_550;
+      break;
+  }
+
+  /* TODO: More detailed error message? */
+  pr_response_add_err(error_code, "%s: %s", orig_path, strerror(xerrno));
+
+  pr_cmd_set_errno(cmd, xerrno);
+  errno = xerrno;
+  return PR_ERROR(cmd);
+}
+
+MODRET digest_opts_hash(cmd_rec *cmd) {
+  char *algo_name;
+
+  if (digest_engine == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (cmd->argc > 2) {
+    pr_response_add_err(R_501, _("OPTS HASH: Wrong number of parameters"));
+    return PR_ERROR(cmd);
+  }
+
+  if (cmd->argc == 1) {
+    int flags = DIGEST_ALGO_FL_IANA_STYLE;
+
+    /* Client is querying the current hash algorithm */
+    pr_response_add(R_200, "%s", get_algo_name(digest_hash_algo, flags));
+    return PR_HANDLED(cmd);
+  }
+
+  /* Client is setting/changing the current hash algorithm. */
+
+  algo_name = cmd->argv[1];
+
+  if (strcasecmp(algo_name, "CRC32") == 0) {
+    if (digest_algos & DIGEST_ALGO_CRC32) {
+      digest_hash_algo = DIGEST_ALGO_CRC32;
+      digest_hash_md = get_algo_md(digest_hash_algo);
+
+    } else {
+      pr_response_add_err(R_501, _("%s: Unsupported algorithm"), algo_name);
+      return PR_ERROR(cmd);
+    }
+
+#ifndef OPENSSL_NO_MD5
+  } else if (strcasecmp(algo_name, "MD5") == 0) {
+    if (digest_algos & DIGEST_ALGO_MD5) {
+      digest_hash_algo = DIGEST_ALGO_MD5;
+      digest_hash_md = get_algo_md(digest_hash_algo);
+
+    } else {
+      pr_response_add_err(R_501, _("%s: Unsupported algorithm"), algo_name);
+      return PR_ERROR(cmd);
+    }
+#endif /* OPENSSL_NO_MD5 */
+
+#ifndef OPENSSL_NO_SHA1
+  } else if (strcasecmp(algo_name, "SHA-1") == 0) {
+    if (digest_algos & DIGEST_ALGO_SHA1) {
+      digest_hash_algo = DIGEST_ALGO_SHA1;
+      digest_hash_md = get_algo_md(digest_hash_algo);
+
+    } else {
+      pr_response_add_err(R_501, _("%s: Unsupported algorithm"), algo_name);
+      return PR_ERROR(cmd);
+    }
+#endif /* OPENSSL_NO_SHA1 */
+
+#ifndef OPENSSL_NO_SHA256
+  } else if (strcasecmp(algo_name, "SHA-256") == 0) {
+    if (digest_algos & DIGEST_ALGO_SHA256) {
+      digest_hash_algo = DIGEST_ALGO_SHA256;
+      digest_hash_md = get_algo_md(digest_hash_algo);
+
+    } else {
+      pr_response_add_err(R_501, _("%s: Unsupported algorithm"), algo_name);
+      return PR_ERROR(cmd);
+    }
+#endif /* OPENSSL_NO_SHA256 */
+
+#ifndef OPENSSL_NO_SHA512
+  } else if (strcasecmp(algo_name, "SHA-512") == 0) {
+    if (digest_algos & DIGEST_ALGO_SHA512) {
+      digest_hash_algo = DIGEST_ALGO_SHA512;
+      digest_hash_md = get_algo_md(digest_hash_algo);
+
+    } else {
+      pr_response_add_err(R_501, _("%s: Unsupported algorithm"), algo_name);
+      return PR_ERROR(cmd);
+    }
+#endif /* OPENSSL_NO_SHA512 */
+
+  } else {
+    pr_response_add_err(R_501, _("%s: Unsupported algorithm"), algo_name);
+    return PR_ERROR(cmd);
+  }
+
+  digest_hash_feat_remove();
+  digest_hash_feat_add(cmd->tmp_pool);
+
+  pr_response_add(R_200, "%s", algo_name);
+  return PR_HANDLED(cmd);
+}
+
+MODRET digest_pre_retr(cmd_rec *cmd) {
+  if (digest_engine == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (digest_caching == FALSE ||
+      (digest_opts & DIGEST_OPT_NO_TRANSFER_CACHE)) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (session.restart_pos > 0) {
+    pr_trace_msg(trace_channel, 12,
+      "REST %" PR_LU " sent before RETR, declining to cache transfer",
+      (pr_off_t) session.restart_pos);
+    return PR_DECLINED(cmd);
+  }
+
+  digest_cache_xfer_ctx = EVP_MD_CTX_create();
+  if (EVP_DigestInit_ex(digest_cache_xfer_ctx, digest_hash_md, NULL) != 1) {
+    EVP_MD_CTX_destroy(digest_cache_xfer_ctx);
+    digest_cache_xfer_ctx = NULL;
+
+  } else {
+    /* XXX TODO register listener for "core.data-write" */
+  }
+
+  return PR_DECLINED(cmd);
+}
+
+MODRET digest_log_retr(cmd_rec *cmd) {
+  if (digest_engine == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (digest_caching == FALSE ||
+      (digest_opts & DIGEST_OPT_NO_TRANSFER_CACHE)) {
+    return PR_DECLINED(cmd);
+  }
+
+  pr_event_unregister(&digest_module, "core.data-write", NULL);
+  if (digest_cache_xfer_ctx != NULL) {
+    EVP_MD_CTX_destroy(digest_cache_xfer_ctx);
+    digest_cache_xfer_ctx = NULL;
+  }
+
+  return PR_DECLINED(cmd);
+}
+
+MODRET digest_pre_stor(cmd_rec *cmd) {
+  if (digest_engine == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (digest_caching == FALSE ||
+      (digest_opts & DIGEST_OPT_NO_TRANSFER_CACHE)) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (session.restart_pos > 0) {
+    pr_trace_msg(trace_channel, 12,
+      "REST %" PR_LU " sent before RETR, declining to cache transfer",
+      (pr_off_t) session.restart_pos);
+  }
+
+  /* XXX TODO register listener for "core.data-read" */
+
+  return PR_DECLINED(cmd);
+}
+
+MODRET digest_log_stor(cmd_rec *cmd) {
+  if (digest_engine == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (digest_caching == FALSE ||
+      (digest_opts & DIGEST_OPT_NO_TRANSFER_CACHE)) {
+    return PR_DECLINED(cmd);
+  }
+
+  pr_event_unregister(&digest_module, "core.data-read", NULL);
+  if (digest_cache_xfer_ctx != NULL) {
+    EVP_MD_CTX_destroy(digest_cache_xfer_ctx);
+    digest_cache_xfer_ctx = NULL;
+  }
+
+  return PR_DECLINED(cmd);
+}
 
 MODRET digest_post_pass(cmd_rec *cmd) {
   config_rec *c;
@@ -1159,7 +1653,7 @@ MODRET digest_xcrc(cmd_rec *cmd) {
     return PR_DECLINED(cmd);
   }
 
-  return digest_cmdex(cmd, algo);
+  return digest_xcmd(cmd, algo);
 }
 
 MODRET digest_xmd5(cmd_rec *cmd) {
@@ -1172,7 +1666,7 @@ MODRET digest_xmd5(cmd_rec *cmd) {
     return PR_DECLINED(cmd);
   }
 
-  return digest_cmdex(cmd, algo);
+  return digest_xcmd(cmd, algo);
 }
 
 MODRET digest_xsha1(cmd_rec *cmd) {
@@ -1185,7 +1679,7 @@ MODRET digest_xsha1(cmd_rec *cmd) {
     return PR_DECLINED(cmd);
   }
 
-  return digest_cmdex(cmd, algo);
+  return digest_xcmd(cmd, algo);
 }
 
 MODRET digest_xsha256(cmd_rec *cmd) {
@@ -1198,7 +1692,7 @@ MODRET digest_xsha256(cmd_rec *cmd) {
     return PR_DECLINED(cmd);
   }
 
-  return digest_cmdex(cmd, algo);
+  return digest_xcmd(cmd, algo);
 }
 
 MODRET digest_xsha512(cmd_rec *cmd) {
@@ -1211,7 +1705,7 @@ MODRET digest_xsha512(cmd_rec *cmd) {
     return PR_DECLINED(cmd);
   }
 
-  return digest_cmdex(cmd, algo);
+  return digest_xcmd(cmd, algo);
 }
 
 /* Event listeners
@@ -1287,33 +1781,11 @@ static int digest_sess_init(void) {
     digest_sha512_tab = pr_table_alloc(digest_pool, 0);
   }
 
-  if (digest_algos & DIGEST_ALGO_CRC32) {
-    pr_feat_add(C_XCRC);
-    pr_help_add(C_XCRC, "<sp> pathname [<sp> start <sp> end]", TRUE);
-  }
+  digest_hash_feat_add(session.pool);
+  pr_help_add(C_HASH, _("<sp> pathname"), TRUE);
 
-  if (digest_algos & DIGEST_ALGO_MD5) {
-    pr_feat_add(C_XMD5);
-    pr_help_add(C_XMD5, "<sp> pathname [<sp> start <sp> end]", TRUE);
-  }
-
-  if (digest_algos & DIGEST_ALGO_SHA1) {
-    pr_feat_add(C_XSHA);
-    pr_help_add(C_XSHA, "<sp> pathname [<sp> start <sp> end]", TRUE);
-
-    pr_feat_add(C_XSHA1);
-    pr_help_add(C_XSHA1, "<sp> pathname [<sp> start <sp> end]", TRUE);
-  }
-
-  if (digest_algos & DIGEST_ALGO_SHA256) {
-    pr_feat_add(C_XSHA256);
-    pr_help_add(C_XSHA256, "<sp> pathname [<sp> startposition <sp> endposition]", TRUE);
-  }
-
-  if (digest_algos & DIGEST_ALGO_SHA512) {
-    pr_feat_add(C_XSHA512);
-    pr_help_add(C_XSHA512, "<sp> pathname [<sp> startposition <sp> endposition]", TRUE);
-  }
+  digest_x_feat_add(session.pool);
+  digest_x_help_add(session.pool);
 
   return 0;
 }
@@ -1322,6 +1794,9 @@ static int digest_sess_init(void) {
  */
 
 static cmdtable digest_cmdtab[] = {
+  { CMD, C_HASH,	G_READ, digest_hash,	TRUE, FALSE, CL_READ|CL_INFO },
+  { CMD, C_OPTS"_HASH",	G_NONE,	digest_opts_hash,FALSE,FALSE },
+
   { CMD, C_XCRC,	G_READ, digest_xcrc,	TRUE, FALSE, CL_READ|CL_INFO },
   { CMD, C_XMD5,	G_READ, digest_xmd5,	TRUE, FALSE, CL_READ|CL_INFO },
   { CMD, C_XSHA,	G_READ, digest_xsha1,	TRUE, FALSE, CL_READ|CL_INFO },
@@ -1330,6 +1805,14 @@ static cmdtable digest_cmdtab[] = {
   { CMD, C_XSHA512,	G_READ, digest_xsha512,	TRUE, FALSE, CL_READ|CL_INFO },
 
   { POST_CMD,	C_PASS, G_NONE,	digest_post_pass, TRUE, FALSE },
+
+  { PRE_CMD,	C_RETR, G_NONE, digest_pre_retr,	TRUE, FALSE },
+  { LOG_CMD,	C_RETR, G_NONE, digest_log_retr,	TRUE, FALSE },
+  { LOG_CMD_ERR,C_RETR, G_NONE, digest_log_retr,	TRUE, FALSE },
+  { PRE_CMD,	C_STOR, G_NONE, digest_pre_stor,	TRUE, FALSE },
+  { LOG_CMD,	C_STOR, G_NONE, digest_log_stor,	TRUE, FALSE },
+  { LOG_CMD_ERR,C_STOR, G_NONE, digest_log_stor,	TRUE, FALSE },
+
   { 0, NULL }
 };
 
