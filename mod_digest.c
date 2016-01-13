@@ -84,8 +84,20 @@ static EVP_MD_CTX *digest_cache_xfer_ctx = NULL;
 
 static int digest_engine = TRUE;
 static pool *digest_pool = NULL;
-static unsigned long digest_opts = 0UL;
+
 #define DIGEST_OPT_NO_TRANSFER_CACHE		0x0001
+
+/* Note that the internal APIs for opportunistic caching only appeared,
+ * in working order, in 1.3.6rc2.  So disable it by default for earlier
+ * versions of proftpd.
+ */
+#if PROFTPD_VERSION_NUMBER < 0x0001030602
+# define DIGEST_DEFAULT_OPTS			DIGEST_OPT_NO_TRANSFER
+#else
+# define DIGEST_DEFAULT_OPTS			0UL
+#endif
+
+static unsigned long digest_opts = DIGEST_DEFAULT_OPTS;
 
 /* Tables used as in-memory caches. */
 static pr_table_t *digest_crc32_tab = NULL;
