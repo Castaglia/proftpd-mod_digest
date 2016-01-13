@@ -726,7 +726,7 @@ static int blacklisted_file(const char *path) {
 
 static int compute_digest(pool *p, const char *path, off_t start, off_t len,
     const EVP_MD *md, unsigned char *digest, unsigned int *digest_len,
-    time_t *mtime, void (*hash_progress_cb)(void)) {
+    time_t *mtime, void (*hash_progress_cb)(const char *, off_t)) {
   int res, xerrno = 0;
   pr_fh_t *fh;
   struct stat st;
@@ -804,9 +804,25 @@ static int compute_digest(pool *p, const char *path, off_t start, off_t len,
 
   iter_count = 0;
   res = pr_fsio_read(fh, (char *) buf, readsz);
-  while (res > 0 && len > 0) {
-    pr_signals_handle();
+  xerrno = errno;
+
+  while (len > 0) {
     iter_count++;
+
+    if (res < 0 &&
+        errno == EAGAIN) {
+      /* Add a small delay by treating this as EINTR. */
+      errno = xerrno = EINTR;
+    }
+
+    pr_signals_handle();
+
+    if (res < 0 &&
+        xerrno == EINTR) {
+      /* If we were interrupted, try again. */
+      res = pr_fsio_read(fh, (char *) buf, readsz);
+      continue;
+    }
 
     if (EVP_DigestUpdate(&md_ctx, buf, res) != 1) {
       pr_log_debug(DEBUG1, MOD_DIGEST_VERSION
@@ -816,8 +832,8 @@ static int compute_digest(pool *p, const char *path, off_t start, off_t len,
     len -= res;
 
     /* Every Nth iteration, invoke the progress callback. */
-    if ((iter_count & DIGEST_PROGRESS_NTH_ITER) == 0) {
-      (hash_progress_cb)();
+    if ((iter_count % DIGEST_PROGRESS_NTH_ITER) == 0) {
+      (hash_progress_cb)(path, len);
     }
 
     readsz = bufsz;
@@ -826,6 +842,7 @@ static int compute_digest(pool *p, const char *path, off_t start, off_t len,
     }
 
     res = pr_fsio_read(fh, (char *) buf, readsz);
+    xerrno = errno;
   }
 
   (void) pr_fsio_close(fh);
@@ -1102,7 +1119,7 @@ static int add_cached_digest(pool *p, unsigned long algo, const char *path,
 
 static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
     time_t mtime, off_t start, size_t len, int flags,
-    void (*hash_progress_cb)(void)) {
+    void (*hash_progress_cb)(const char *, off_t)) {
   int res;
   const EVP_MD *md;
   unsigned char *digest = NULL;
@@ -1173,7 +1190,11 @@ static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
   return hex_digest;
 }
 
-static void digest_progress_cb(void) {
+static void digest_progress_cb(const char *path, off_t remaining) {
+  pr_trace_msg(trace_channel, 19,
+    "%" PR_LU " bytes remaining for digesting of '%s'", (pr_off_t) remaining,
+    path);
+
   /* Make sure to reset the idle timer, to prevent ProFTPD from timing out
    * the session.
    */
