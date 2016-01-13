@@ -1318,12 +1318,18 @@ static modret_t *digest_xcmd(cmd_rec *cmd, unsigned long algo) {
       end_pos = st.st_size;
     }
 
+    if (end_pos > st.st_size) {
+      pr_response_add_err(R_501,
+        _("%s: end exceeds file size"), (char *) cmd->argv[0]);
+      return PR_ERROR(cmd);
+    }
+
     len = end_pos - start_pos;
 
-    if (start_pos > end_pos) {
+    if (start_pos >= end_pos) {
       pr_response_add_err(R_501,
         _("%s requires end (%" PR_LU ") greater than start (%" PR_LU ")"),
-        (char *) cmd->argv[0], (pr_off_t) end_pos, (pr_off_t) end_pos);
+        (char *) cmd->argv[0], (pr_off_t) end_pos, (pr_off_t) start_pos);
       return PR_ERROR(cmd);
     }
 
