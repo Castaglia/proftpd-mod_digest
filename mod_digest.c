@@ -128,6 +128,13 @@ static unsigned long digest_hash_algo = DIGEST_ALGO_SHA1;
 /* Flags for determining the style of hash function names. */
 #define DIGEST_ALGO_FL_IANA_STYLE	0x0001
 
+/* We will invoke the progress callback every Nth iteration of the read(2)
+ * loop when digesting a file.
+ */
+#ifndef DIGEST_PROGRESS_NTH_ITER
+# define DIGEST_PROGRESS_NTH_ITER	10000
+#endif
+
 static const char *trace_channel = "digest";
 
 /* Necessary prototypes. */
@@ -809,7 +816,7 @@ static int compute_digest(pool *p, const char *path, off_t start, off_t len,
     len -= res;
 
     /* Every Nth iteration, invoke the progress callback. */
-    if (iter_count % 10000 == 0) {
+    if ((iter_count & DIGEST_PROGRESS_NTH_ITER) == 0) {
       (hash_progress_cb)();
     }
 
@@ -1167,6 +1174,14 @@ static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
 }
 
 static void digest_progress_cb(void) {
+  /* Make sure to reset the idle timer, to prevent ProFTPD from timing out
+   * the session.
+   */
+  pr_timer_reset(PR_TIMER_IDLE, ANY_MODULE);
+
+  /* AND write something on the control connection, to prevent any middleboxes
+   * from timing out the session.
+   */
   pr_response_add(R_DUP, _("Calculating..."));
 }
 
@@ -1415,6 +1430,11 @@ MODRET digest_hash(cmd_rec *cmd) {
     case EAGAIN:
       /* The HASH draft recommends using 450 for these cases. */
       error_code = R_450;
+      break;
+
+    case EISDIR:
+      /* The HASH draft recommends using 553 for these cases. */
+      error_code = R_553;
       break;
 
     default:
