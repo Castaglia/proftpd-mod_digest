@@ -354,9 +354,6 @@ static void digest_hash_feat_add(pool *p) {
       NULL);
   }
 
-  /* Note: What happens if SHA1 is disabled?  Need to properly mark, via
-   * asterisk, the next best default hash (can't be MD5 or CRC32).
-   */
   if (digest_algos & DIGEST_ALGO_SHA1) {
     int current_hash;
 
@@ -812,7 +809,7 @@ static int compute_digest(pool *p, const char *path, off_t start, size_t len,
     len -= res;
 
     /* Every Nth iteration, invoke the progress callback. */
-    if (iter_count & 10000) {
+    if (iter_count % 10000 == 0) {
       (hash_progress_cb)();
     }
 
@@ -2013,9 +2010,6 @@ static void digest_mod_unload_ev(const void *event_data, void *user_data) {
 }
 #endif /* PR_SHARED_MODULE */
 
-static void digest_restart_ev(const void *event_data, void *user_data) {
-}
-
 /* Initialization routines
  */
 
@@ -2027,7 +2021,6 @@ static int digest_init(void) {
   pr_event_register(&digest_module, "core.module-unload", digest_mod_unload_ev,
     NULL);
 #endif /* PR_SHARED_MODULE */
-  pr_event_register(&digest_module, "core.restart", digest_restart_ev, NULL);
 
   return 0;
 }
@@ -2048,6 +2041,33 @@ static int digest_sess_init(void) {
   if (c != NULL) {
     digest_algos = *((unsigned long *) c->argv[0]);
   }
+
+  /* Use the configured algorithms to determine our default HASH; it may be
+   * that SHA1 is disabled or not available via OpenSSL.
+   *
+   * Per the HASH Draft, the default HASH SHOULD be SHA1; if not, it should
+   * be a "stronger" HASH function.  Thus this ordering may not be what you
+   * would expect.
+   */
+
+  if (digest_algos & DIGEST_ALGO_SHA1) {
+    digest_hash_algo = DIGEST_ALGO_SHA1;
+
+  } else if (digest_algos & DIGEST_ALGO_SHA256) {
+    digest_hash_algo = DIGEST_ALGO_SHA256;
+
+  } else if (digest_algos & DIGEST_ALGO_SHA512) {
+    digest_hash_algo = DIGEST_ALGO_SHA512;
+
+  } else if (digest_algos & DIGEST_ALGO_MD5) {
+    digest_hash_algo = DIGEST_ALGO_MD5;
+
+  } else {
+    /* We are GUARANTEED to always be able to do CRC32. */
+    digest_hash_algo = DIGEST_ALGO_CRC32;
+  }
+
+  digest_hash_md = get_algo_md(digest_hash_algo);
 
   c = find_config(main_server->conf, CONF_PARAM, "DigestCache", FALSE);
   if (c != NULL) {
