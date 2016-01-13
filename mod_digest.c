@@ -131,6 +131,7 @@ static unsigned long digest_hash_algo = DIGEST_ALGO_SHA1;
 static const char *trace_channel = "digest";
 
 /* Necessary prototypes. */
+static void digest_data_xfer_ev(const void *event_data, void *user_data);
 static const char *get_algo_name(unsigned long algo, int flags);
 
 #if PROFTPD_VERSION_NUMBER < 0x0001030602
@@ -1149,7 +1150,7 @@ static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
   if (add_cached_digest(cmd->tmp_pool, algo, path, mtime, start, len,
       hex_digest) < 0) {
     pr_trace_msg(trace_channel, 8,
-      "error caching %s digest for path '%s': %s", OBJ_nid2sn(EVP_MD_type(md)),
+      "error caching %s digest for path '%s': %s", get_algo_name(algo, 0),
       path, strerror(errno));
   }
 
@@ -1236,7 +1237,7 @@ static modret_t *digest_xcmd(cmd_rec *cmd, unsigned long algo) {
     return PR_ERROR(cmd);
 
   } else {
-    off_t len, start_pos = 0, end_pos = 0;
+    off_t len, start_pos, end_pos;
 
     if (cmd->argc > 3) {
       char *ptr = NULL;
@@ -1266,6 +1267,10 @@ static modret_t *digest_xcmd(cmd_rec *cmd, unsigned long algo) {
           _("%s requires an end greater than 0"), (char *) cmd->argv[0]);
         return PR_ERROR(cmd);
       }
+
+    } else {
+      start_pos = 0;
+      end_pos = st.st_size;
     }
 
     len = end_pos - start_pos;
@@ -1390,11 +1395,8 @@ MODRET digest_hash(cmd_rec *cmd) {
     return PR_ERROR(cmd);
   }
 
-  pr_trace_msg(trace_channel, 14,
-    "%s: using %s algorithm on path '%s', mtime = %lu, start_pos = %" PR_LU
-    ", end_pos = %" PR_LU, (char *) cmd->argv[0],
-    get_algo_name(digest_hash_algo, 0), path, (unsigned long) st.st_mtime,
-    (pr_off_t) start_pos, (pr_off_t) end_pos);
+  pr_trace_msg(trace_channel, 14, "%s: using %s algorithm on path '%s'",
+    (char *) cmd->argv[0], get_algo_name(digest_hash_algo, 0), path);
 
   pr_response_add(R_213, _("%s: Calculating %s digest"), (char *) cmd->argv[0],
     get_algo_name(digest_hash_algo, DIGEST_ALGO_FL_IANA_STYLE));
@@ -1526,6 +1528,74 @@ MODRET digest_opts_hash(cmd_rec *cmd) {
 }
 
 MODRET digest_pre_retr(cmd_rec *cmd) {
+  config_rec *c;
+  unsigned char use_sendfile = TRUE;
+
+  if (digest_engine == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (digest_caching == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (session.sf_flags & SF_ASCII) {
+    pr_trace_msg(trace_channel, 19,
+      "%s: ASCII mode transfer (TYPE A) in effect, not computing/caching "
+      "opportunistic digest for download", (char *) cmd->argv[0]);
+    return PR_DECLINED(cmd);
+  }
+
+  if (digest_opts & DIGEST_OPT_NO_TRANSFER_CACHE) {
+    pr_trace_msg(trace_channel, 19,
+      "%s: NoTransferCache DigestOption in effect, not computing/caching "
+      "opportunistic digest for download", (char *) cmd->argv[0]);
+    return PR_DECLINED(cmd);
+  }
+
+  if (session.restart_pos > 0) {
+    pr_trace_msg(trace_channel, 12,
+      "REST %" PR_LU " sent before %s, declining to compute transfer digest",
+      (pr_off_t) session.restart_pos, (char *) cmd->argv[0]);
+    return PR_DECLINED(cmd);
+  }
+
+  /* If UseSendfile is in effect, then we cannot watch the outbound traffic.
+   * Note that UseSendfile is enabled by default.
+   */
+  c = find_config(CURRENT_CONF, CONF_PARAM, "UseSendfile", FALSE);
+  if (c != NULL) {
+    use_sendfile = *((unsigned char *) c->argv[0]);
+  }
+
+  if (use_sendfile) {
+    pr_trace_msg(trace_channel, 12,
+      "UseSendfile in effect, declining to compute digest for %s transfer",
+      (char *) cmd->argv[0]);
+    return PR_DECLINED(cmd);
+  }
+
+  digest_cache_xfer_ctx = EVP_MD_CTX_create();
+  if (EVP_DigestInit_ex(digest_cache_xfer_ctx, digest_hash_md, NULL) != 1) {
+    pr_trace_msg(trace_channel, 3,
+      "error preparing %s digest: %s", get_algo_name(digest_hash_algo, 0),
+      get_errors());
+    EVP_MD_CTX_destroy(digest_cache_xfer_ctx);
+    digest_cache_xfer_ctx = NULL;
+
+  } else {
+    pr_event_register(&digest_module, "core.data-write", digest_data_xfer_ev,
+      digest_cache_xfer_ctx);
+  }
+
+  return PR_DECLINED(cmd);
+}
+
+MODRET digest_log_retr(cmd_rec *cmd) {
+  const char *algo_name;
+  unsigned char *digest;
+  unsigned int digest_len;
+
   if (digest_engine == FALSE) {
     return PR_DECLINED(cmd);
   }
@@ -1535,26 +1605,62 @@ MODRET digest_pre_retr(cmd_rec *cmd) {
     return PR_DECLINED(cmd);
   }
 
-  if (session.restart_pos > 0) {
-    pr_trace_msg(trace_channel, 12,
-      "REST %" PR_LU " sent before RETR, declining to cache transfer",
-      (pr_off_t) session.restart_pos);
+  if (digest_cache_xfer_ctx == NULL) {
+    /* Not sure how this would happen...? */
     return PR_DECLINED(cmd);
   }
 
-  digest_cache_xfer_ctx = EVP_MD_CTX_create();
-  if (EVP_DigestInit_ex(digest_cache_xfer_ctx, digest_hash_md, NULL) != 1) {
-    EVP_MD_CTX_destroy(digest_cache_xfer_ctx);
-    digest_cache_xfer_ctx = NULL;
+  algo_name = get_algo_name(digest_hash_algo, 0);
+  digest_len = EVP_MD_size(digest_hash_md);
+  digest = palloc(cmd->tmp_pool, digest_len);
+
+  if (EVP_DigestFinal_ex(digest_cache_xfer_ctx, digest, &digest_len) != 1) {
+    pr_trace_msg(trace_channel, 1,
+      "error finishing %s digest for %s: %s", algo_name,
+      (char *) cmd->argv[0], get_errors());
 
   } else {
-    /* XXX TODO register listener for "core.data-write" */
+    int res;
+    struct stat st;
+    char *path;
+
+    path = session.xfer.path;
+    pr_fs_clear_cache2(path);
+    res = pr_fsio_stat(path, &st);
+    if (res == 0) {
+      char *hex_digest;
+      off_t start, len;
+      time_t mtime;
+
+      hex_digest = pr_str_bin2hex(cmd->tmp_pool, digest, digest_len,
+        PR_STR_FL_HEX_USE_LC);
+
+      mtime = st.st_mtime;
+      start = 0;
+      len = st.st_size;
+
+      if (add_cached_digest(cmd->tmp_pool, digest_hash_algo, path, mtime,
+          start, len, hex_digest) < 0) {
+        pr_trace_msg(trace_channel, 8,
+          "error caching %s digest for path '%s': %s", algo_name, path,
+          strerror(errno));
+      }
+
+    } else {
+      pr_trace_msg(trace_channel, 7,
+        "error checking '%s' post-%s: %s", path, (char *) cmd->argv[0],
+        strerror(errno));
+    }
   }
+
+  pr_event_unregister(&digest_module, "core.data-write", NULL);
+  EVP_MD_CTX_destroy(digest_cache_xfer_ctx);
+  digest_cache_xfer_ctx = NULL;
 
   return PR_DECLINED(cmd);
 }
 
-MODRET digest_log_retr(cmd_rec *cmd) {
+MODRET digest_log_retr_err(cmd_rec *cmd) {
   if (digest_engine == FALSE) {
     return PR_DECLINED(cmd);
   }
@@ -1573,7 +1679,132 @@ MODRET digest_log_retr(cmd_rec *cmd) {
   return PR_DECLINED(cmd);
 }
 
+MODRET digest_pre_appe(cmd_rec *cmd) {
+  int res;
+  struct stat st;
+  char *path;
+
+  if (digest_engine == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (digest_caching == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  /* If we are appending to an existing file, then do NOT compute the digest;
+   * we only do the opportunistic digest computation for complete files.  If
+   * file exists, but is zero length, then do proceed with the computation.
+   */
+
+  path = pr_fs_decode_path(cmd->tmp_pool, cmd->arg);
+  if (path == NULL) {
+    return PR_DECLINED(cmd);
+  }
+
+  pr_fs_clear_cache2(path);
+  res = pr_fsio_stat(path, &st);
+  if (res == 0) {
+    if (!S_ISREG(st.st_mode)) {
+      /* Not a regular file. */
+      return PR_DECLINED(cmd);
+    }
+
+    if (st.st_size > 0) {
+      /* Not a zero length file. */
+      return PR_DECLINED(cmd);
+    }
+  }
+
+  if (session.sf_flags & SF_ASCII) {
+    pr_trace_msg(trace_channel, 19,
+      "%s: ASCII mode transfer (TYPE A) in effect, not computing/caching "
+      "opportunistic digest for upload", (char *) cmd->argv[0]);
+    return PR_DECLINED(cmd);
+  }
+
+  if (digest_opts & DIGEST_OPT_NO_TRANSFER_CACHE) {
+    pr_trace_msg(trace_channel, 19,
+      "%s: NoTransferCache DigestOption in effect, not computing/caching "
+      "opportunistic digest for upload", (char *) cmd->argv[0]);
+    return PR_DECLINED(cmd);
+  }
+
+  /* Does REST + APPE even make any sense? */
+  if (session.restart_pos > 0) {
+    pr_trace_msg(trace_channel, 12,
+      "REST %" PR_LU " sent before %s, declining to compute transfer digest",
+      (pr_off_t) session.restart_pos, (char *) cmd->argv[0]);
+    return PR_DECLINED(cmd);
+  }
+
+  digest_cache_xfer_ctx = EVP_MD_CTX_create();
+  if (EVP_DigestInit_ex(digest_cache_xfer_ctx, digest_hash_md, NULL) != 1) {
+    pr_trace_msg(trace_channel, 3,
+      "error preparing %s digest: %s", get_algo_name(digest_hash_algo, 0),
+      get_errors());
+    EVP_MD_CTX_destroy(digest_cache_xfer_ctx);
+    digest_cache_xfer_ctx = NULL;
+
+  } else {
+    pr_event_register(&digest_module, "core.data-read", digest_data_xfer_ev,
+      digest_cache_xfer_ctx);
+  }
+
+  return PR_DECLINED(cmd);
+}
+
 MODRET digest_pre_stor(cmd_rec *cmd) {
+  if (digest_engine == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (digest_caching == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (session.sf_flags & SF_ASCII) {
+    pr_trace_msg(trace_channel, 19,
+      "%s: ASCII mode transfer (TYPE A) in effect, not computing/caching "
+      "opportunistic digest for upload", (char *) cmd->argv[0]);
+    return PR_DECLINED(cmd);
+  }
+
+  if (digest_opts & DIGEST_OPT_NO_TRANSFER_CACHE) {
+    pr_trace_msg(trace_channel, 19,
+      "%s: NoTransferCache DigestOption in effect, not computing/caching "
+      "opportunistic digest for upload", (char *) cmd->argv[0]);
+    return PR_DECLINED(cmd);
+  }
+
+  if (session.restart_pos > 0) {
+    pr_trace_msg(trace_channel, 12,
+      "REST %" PR_LU " sent before %s, declining to compute transfer digest",
+      (pr_off_t) session.restart_pos, (char *) cmd->argv[0]);
+    return PR_DECLINED(cmd);
+  }
+
+  digest_cache_xfer_ctx = EVP_MD_CTX_create();
+  if (EVP_DigestInit_ex(digest_cache_xfer_ctx, digest_hash_md, NULL) != 1) {
+    pr_trace_msg(trace_channel, 3,
+      "error preparing %s digest: %s", get_algo_name(digest_hash_algo, 0),
+      get_errors());
+    EVP_MD_CTX_destroy(digest_cache_xfer_ctx);
+    digest_cache_xfer_ctx = NULL;
+
+  } else {
+    pr_event_register(&digest_module, "core.data-read", digest_data_xfer_ev,
+      digest_cache_xfer_ctx);
+  }
+
+  return PR_DECLINED(cmd);
+}
+
+MODRET digest_log_stor(cmd_rec *cmd) {
+  const char *algo_name;
+  unsigned char *digest;
+  unsigned int digest_len;
+
   if (digest_engine == FALSE) {
     return PR_DECLINED(cmd);
   }
@@ -1583,18 +1814,62 @@ MODRET digest_pre_stor(cmd_rec *cmd) {
     return PR_DECLINED(cmd);
   }
 
-  if (session.restart_pos > 0) {
-    pr_trace_msg(trace_channel, 12,
-      "REST %" PR_LU " sent before RETR, declining to cache transfer",
-      (pr_off_t) session.restart_pos);
+  if (digest_cache_xfer_ctx == NULL) {
+    /* Not sure how this would happen...? */
+    return PR_DECLINED(cmd);
   }
 
-  /* XXX TODO register listener for "core.data-read" */
+  algo_name = get_algo_name(digest_hash_algo, 0);
+  digest_len = EVP_MD_size(digest_hash_md);
+  digest = palloc(cmd->tmp_pool, digest_len);
+
+  if (EVP_DigestFinal_ex(digest_cache_xfer_ctx, digest, &digest_len) != 1) {
+    pr_trace_msg(trace_channel, 1,
+      "error finishing %s digest for %s: %s", algo_name, (char *) cmd->argv[0],
+      get_errors());
+
+  } else {
+    int res;
+    struct stat st;
+    char *path;
+
+    path = session.xfer.path;
+    pr_fs_clear_cache2(path);
+    res = pr_fsio_stat(path, &st);
+    if (res == 0) {
+      char *hex_digest;
+      off_t start, len;
+      time_t mtime;
+
+      hex_digest = pr_str_bin2hex(cmd->tmp_pool, digest, digest_len,
+        PR_STR_FL_HEX_USE_LC);
+
+      mtime = st.st_mtime;
+      start = 0;
+      len = session.xfer.total_bytes;
+
+      if (add_cached_digest(cmd->tmp_pool, digest_hash_algo, path, mtime,
+          start, len, hex_digest) < 0) {
+        pr_trace_msg(trace_channel, 8,
+          "error caching %s digest for path '%s': %s", algo_name, path,
+          strerror(errno));
+      }
+
+    } else {
+      pr_trace_msg(trace_channel, 7,
+        "error checking '%s' post-%s: %s", path, (char *) cmd->argv[0],
+        strerror(errno));
+    }
+  }
+
+  pr_event_unregister(&digest_module, "core.data-read", NULL);
+  EVP_MD_CTX_destroy(digest_cache_xfer_ctx);
+  digest_cache_xfer_ctx = NULL;
 
   return PR_DECLINED(cmd);
 }
 
-MODRET digest_log_stor(cmd_rec *cmd) {
+MODRET digest_log_stor_err(cmd_rec *cmd) {
   if (digest_engine == FALSE) {
     return PR_DECLINED(cmd);
   }
@@ -1711,6 +1986,25 @@ MODRET digest_xsha512(cmd_rec *cmd) {
 /* Event listeners
  */
 
+static void digest_data_xfer_ev(const void *event_data, void *user_data) {
+  const pr_buffer_t *pbuf;
+  EVP_MD_CTX *md_ctx;
+
+  pbuf = event_data;
+  md_ctx = user_data;
+
+  if (EVP_DigestUpdate(md_ctx, pbuf->buf, pbuf->buflen) != 1) {
+    pr_trace_msg(trace_channel, 3,
+      "error updating %s digest: %s", get_algo_name(digest_hash_algo, 0),
+      get_errors());
+
+  } else {
+    pr_trace_msg(trace_channel, 19,
+      "updated %s digest with %lu bytes", get_algo_name(digest_hash_algo, 0),
+      (unsigned long) pbuf->buflen);
+  }
+}
+
 #if defined(PR_SHARED_MODULE)
 static void digest_mod_unload_ev(const void *event_data, void *user_data) {
   if (strcmp((char *) event_data, "mod_digest.c") == 0) {
@@ -1806,12 +2100,16 @@ static cmdtable digest_cmdtab[] = {
 
   { POST_CMD,	C_PASS, G_NONE,	digest_post_pass, TRUE, FALSE },
 
+  /* Command handlers for opportunistic digest computation/caching. */
+  { PRE_CMD,	C_APPE, G_NONE, digest_pre_appe,	TRUE, FALSE },
+  { LOG_CMD,	C_APPE, G_NONE, digest_log_stor,	TRUE, FALSE },
+  { LOG_CMD_ERR,C_APPE, G_NONE, digest_log_stor_err,	TRUE, FALSE },
   { PRE_CMD,	C_RETR, G_NONE, digest_pre_retr,	TRUE, FALSE },
   { LOG_CMD,	C_RETR, G_NONE, digest_log_retr,	TRUE, FALSE },
-  { LOG_CMD_ERR,C_RETR, G_NONE, digest_log_retr,	TRUE, FALSE },
+  { LOG_CMD_ERR,C_RETR, G_NONE, digest_log_retr_err,	TRUE, FALSE },
   { PRE_CMD,	C_STOR, G_NONE, digest_pre_stor,	TRUE, FALSE },
   { LOG_CMD,	C_STOR, G_NONE, digest_log_stor,	TRUE, FALSE },
-  { LOG_CMD_ERR,C_STOR, G_NONE, digest_log_stor,	TRUE, FALSE },
+  { LOG_CMD_ERR,C_STOR, G_NONE, digest_log_stor_err,	TRUE, FALSE },
 
   { 0, NULL }
 };
