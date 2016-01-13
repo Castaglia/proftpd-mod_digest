@@ -1272,10 +1272,6 @@ static modret_t *digest_xcmd(cmd_rec *cmd, unsigned long algo) {
 
     len = end_pos - start_pos;
 
-    pr_log_debug(DEBUG10, MOD_DIGEST_VERSION
-      ": '%s' start=%" PR_LU ", end=%" PR_LU ", len=%" PR_LU, cmd->arg,
-      (pr_off_t) start_pos, (pr_off_t) end_pos, (pr_off_t) len);
-
     if (start_pos > end_pos) {
       pr_response_add_err(R_501,
         _("%s requires end (%" PR_LU ") greater than start (%" PR_LU ")"),
@@ -1284,9 +1280,9 @@ static modret_t *digest_xcmd(cmd_rec *cmd, unsigned long algo) {
     }
 
     if (check_digest_max_size(len) < 0) {
-      pr_response_add_err(R_550,
-       _("%s: Requested length (%" PR_LU ") exceeds site policy"),
-       (char *) cmd->argv[0], (pr_off_t) len);
+      pr_response_add_err(R_550, "%s: %s", orig_path, strerror(EPERM));
+      pr_cmd_set_errno(cmd, EPERM);
+      errno = EPERM;
       return PR_ERROR(cmd);
     }
 
@@ -1386,9 +1382,9 @@ MODRET digest_hash(cmd_rec *cmd) {
   len = end_pos - start_pos;
 
   if (check_digest_max_size(len) < 0) {
-    pr_response_add_err(R_556,
-     _("%s: Requested length (%" PR_LU ") exceeds site policy"),
-     (char *) cmd->argv[0], (pr_off_t) len);
+    pr_response_add_err(R_556, "%s: %s", orig_path, strerror(EPERM));
+    pr_cmd_set_errno(cmd, EPERM);
+    errno = EPERM;
     return PR_ERROR(cmd);
   }
 
