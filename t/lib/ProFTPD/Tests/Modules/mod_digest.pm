@@ -114,6 +114,11 @@ my $TESTS = {
     test_class => [qw(forking)],
   },
 
+  digest_host => {
+    order => ++$order,
+    test_class => [qw(forking)],
+  },
+
   digest_path_offset_length => {
     order => ++$order,
     test_class => [qw(forking)],
@@ -200,11 +205,6 @@ my $TESTS = {
   },
 
   digest_failed_start_pos_after_end_pos => {
-    order => ++$order,
-    test_class => [qw(forking)],
-  },
-
-  digest_failed_start_pos_equals_end_pos => {
     order => ++$order,
     test_class => [qw(forking)],
   },
@@ -2513,6 +2513,197 @@ sub digest_xsha512 {
       $expected = $expected_digest;
       $self->assert($expected eq $resp_msg,
         test_msg("Expected response message '$expected', got '$resp_msg'"));
+    };
+
+    if ($@) {
+      $ex = $@;
+    }
+
+    $wfh->print("done\n");
+    $wfh->flush();
+
+  } else {
+    eval { server_wait($setup->{config_file}, $rfh) };
+    if ($@) {
+      warn($@);
+      exit 1;
+    }
+
+    exit 0;
+  }
+
+  # Stop server
+  server_stop($setup->{pid_file});
+  $self->assert_child_ok($pid);
+
+  test_cleanup($setup->{log_file}, $ex);
+}
+
+sub digest_host {
+  my $self = shift;
+  my $tmpdir = $self->{tmpdir};
+  my $setup = test_setup($tmpdir, 'digest');
+
+  require Digest::SHA1;
+
+  my $test_file = File::Spec->rel2abs("$tmpdir/test.txt");
+  if (open(my $fh, "> $test_file")) {
+    print $fh "Hello, World!\n";
+    unless (close($fh)) {
+      die("Can't write $test_file: $!");
+    }
+
+  } else {
+    die("Can't open $test_file: $!");
+  }
+
+  my $expected_digest;
+
+  if (open(my $fh, "< $test_file")) {
+    my $ctx = Digest::SHA1->new();
+    $ctx->addfile($fh);
+    $expected_digest = $ctx->hexdigest;
+    close($fh);
+
+  } else {
+    die("Can't read $test_file: $!");
+  }
+
+  my $config = {
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
+    Trace => 'digest:20',
+
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    DefaultServer => 'on',
+    ServerName => '"Default Server"',
+
+    IfModules => {
+      'mod_delay.c' => {
+        DelayEngine => 'off',
+      },
+
+      'mod_digest.c' => {
+        DigestEngine => 'off',
+      },
+    },
+  };
+
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
+
+  my $host = 'localhost';
+
+  if (open(my $fh, ">> $setup->{config_file}")) {
+    print $fh <<EOC;
+# This virtual host is name-based
+<VirtualHost 127.0.0.1>
+  Port $port
+  ServerAlias $host
+  ServerName "Digest Server"
+
+  AuthUserFile $setup->{auth_user_file}
+  AuthGroupFile $setup->{auth_group_file}
+  AuthOrder mod_auth_file.c
+
+  <IfModule mod_delay.c>
+    DelayEngine off
+  </IfModule>
+
+  <IfModule mod_digest.c>
+    DigestEngine on
+  </IfModule>
+</VirtualHost>
+EOC
+    unless (close($fh)) {
+      die("Can't write $setup->{config_file}: $!");
+    }
+
+  } else {
+    die("Can't open $setup->{config_file}: $!");
+  }
+
+  # Open pipes, for use between the parent and child processes.  Specifically,
+  # the child will indicate when it's done with its test by writing a message
+  # to the parent.
+  my ($rfh, $wfh);
+  unless (pipe($rfh, $wfh)) {
+    die("Can't open pipe: $!");
+  }
+
+  my $ex;
+
+  # Fork child
+  $self->handle_sigchld();
+  defined(my $pid = fork()) or die("Can't fork: $!");
+  if ($pid) {
+    eval {
+      # Allow server to start up
+      sleep(1);
+
+      my $algo = 'SHA-1';
+      my $client = ProFTPD::TestSuite::FTP->new('127.0.0.1', $port, 0, 1);
+      my ($resp_code, $resp_msg) = $client->host($host);
+
+      my $expected = 220;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      ($resp_code, $resp_msg) = $client->opts('HASH');
+      $expected = 200;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = $algo;
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+
+      $client->feat();
+      $resp_code = $client->response_code();
+      my $resp_msgs = $client->response_msgs();
+
+      $expected = 211;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      my $expected_feat = ' HASH CRC32;MD5;SHA-1*;SHA-256;SHA-512;';
+
+      my $found = 0;
+      my $nfeat = scalar(@$resp_msgs);
+      for (my $i = 0; $i < $nfeat; $i++) {
+        if ($resp_msgs->[$i] eq $expected_feat) {
+          $found = 1;
+          last;
+        }
+      }
+
+      $self->assert($found, test_msg("Did not see '$expected_feat'"));
+
+      $client->login($setup->{user}, $setup->{passwd});
+
+      ($resp_code, $resp_msg) = $client->quote('HASH', 'test.txt');
+      $expected = 213;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      my $filesz = -s $test_file;
+      $expected = "$algo 0-$filesz $expected_digest test.txt";
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+
+      ($resp_code, $resp_msg) = $client->quote('XSHA1', 'test.txt');
+      $expected = 250;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = uc($expected_digest);
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+
+      $client->quit();
     };
 
     if ($@) {
@@ -4952,7 +5143,7 @@ sub digest_config_engine {
       $self->assert($expected == $resp_code,
         test_msg("Expected response code $expected, got $resp_code"));
 
-      my $expected_feat = ' HASH CRC32:MD5;SHA-1*;SHA-256;SHA-512';
+      my $expected_feat = ' HASH CRC32;MD5;SHA-1*;SHA-256;SHA-512;';
 
       my $found = 0;
       my $nfeat = scalar(@$resp_msgs);

@@ -151,6 +151,7 @@ static const char *trace_channel = "digest";
 
 /* Necessary prototypes. */
 static void digest_data_xfer_ev(const void *event_data, void *user_data);
+static int digest_sess_init(void);
 static const char *get_algo_name(unsigned long algo, int flags);
 
 #if PROFTPD_VERSION_NUMBER < 0x0001030602
@@ -2085,6 +2086,29 @@ static void digest_mod_unload_ev(const void *event_data, void *user_data) {
 }
 #endif /* PR_SHARED_MODULE */
 
+static void digest_sess_reinit_ev(const void *event_data, void *user_data) {
+  int res;
+
+  /* A HOST command changed the main_server pointer; reinitialize ourselves. */
+
+  pr_event_unregister(&digest_module, "core.session-reinit",
+    digest_sess_reinit_ev);
+
+  digest_caching = TRUE;
+  digest_engine = TRUE;
+  digest_cache_max_size = DIGEST_CACHE_DEFAULT_SIZE;
+  digest_opts = DIGEST_DEFAULT_OPTS;
+  digest_algos = DIGEST_DEFAULT_ALGOS;
+  digest_hash_algo = DIGEST_ALGO_SHA1;
+  digest_hash_md = NULL;
+
+  res = digest_sess_init();
+  if (res < 0) {
+    pr_session_disconnect(&digest_module,
+      PR_SESS_DISCONNECT_SESSION_INIT_FAILED, NULL);
+  }
+}
+
 /* Initialization routines
  */
 
@@ -2102,6 +2126,9 @@ static int digest_init(void) {
 
 static int digest_sess_init(void) {
   config_rec *c;
+
+  pr_event_register(&digest_module, "core.session-reinit",
+    digest_sess_reinit_ev, NULL);
 
   c = find_config(main_server->conf, CONF_PARAM, "DigestEngine", FALSE);
   if (c != NULL) {
