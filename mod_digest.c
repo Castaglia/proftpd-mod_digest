@@ -144,7 +144,7 @@ static unsigned long digest_hash_algo = DIGEST_ALGO_SHA1;
  * loop when digesting a file.
  */
 #ifndef DIGEST_PROGRESS_NTH_ITER
-# define DIGEST_PROGRESS_NTH_ITER	50000
+# define DIGEST_PROGRESS_NTH_ITER	40000
 #endif
 
 static const char *trace_channel = "digest";
@@ -800,6 +800,7 @@ static int compute_digest(pool *p, const char *path, off_t start, off_t len,
     pr_log_debug(DEBUG1, MOD_DIGEST_VERSION
       ": error preparing digest context: %s", get_errors());
     (void) pr_fsio_close(fh);
+    EVP_MD_CTX_cleanup(&md_ctx);
     errno = EPERM;
     return -1;
   }
@@ -857,6 +858,7 @@ static int compute_digest(pool *p, const char *path, off_t start, off_t len,
   (void) pr_fsio_close(fh);
 
   if (len != 0) {
+    EVP_MD_CTX_cleanup(&md_ctx);
     pr_log_debug(DEBUG3, MOD_DIGEST_VERSION
       ": failed to read all %" PR_LU " bytes of '%s' (premature EOF?)",
       (pr_off_t) len, path);
@@ -867,10 +869,12 @@ static int compute_digest(pool *p, const char *path, off_t start, off_t len,
   if (EVP_DigestFinal_ex(&md_ctx, digest, digest_len) != 1) {
     pr_log_debug(DEBUG1, MOD_DIGEST_VERSION
       ": error finishing digest: %s", get_errors());
+    EVP_MD_CTX_cleanup(&md_ctx);
     errno = EPERM;
     return -1;
   }
 
+  EVP_MD_CTX_cleanup(&md_ctx);
   return 0;
 }
 
@@ -1058,10 +1062,9 @@ static const char *get_cache_key(pool *p, const char *path,
 
 static char *get_cached_digest(pool *p, unsigned long algo, const char *path,
     time_t mtime, off_t start, size_t len) {
-  const char *key;
+  const char *algo_name, *key;
   pr_table_t *cache;
   void *val;
-  size_t valsz = 0;
 
   if (digest_caching == FALSE) {
     errno = ENOENT;
@@ -1078,16 +1081,19 @@ static char *get_cached_digest(pool *p, unsigned long algo, const char *path,
     return NULL;
   }
 
-  val = pr_table_get(cache, key, &valsz);
+  algo_name = get_algo_name(algo, 0);
+
+  pr_trace_msg(trace_channel, 19,
+    "checking for cached %s digest using key '%s'", algo_name, key);
+
+  val = pr_table_get(cache, key, NULL);
   if (val != NULL) {
     char *hex_digest;
 
-    hex_digest = palloc(p, valsz);
-    memcpy(hex_digest, val, valsz);
-
+    hex_digest = pstrdup(p, val);
     pr_trace_msg(trace_channel, 12,
       "using cached digest '%s' for %s digest, key '%s'", hex_digest,
-      get_algo_name(algo, 0), key);
+      algo_name, key);
     return hex_digest;
   }
 
@@ -1200,6 +1206,8 @@ static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
 }
 
 static void digest_progress_cb(const char *path, off_t remaining) {
+  int res;
+
   pr_trace_msg(trace_channel, 19,
     "%" PR_LU " bytes remaining for digesting of '%s'", (pr_off_t) remaining,
     path);
@@ -1207,7 +1215,11 @@ static void digest_progress_cb(const char *path, off_t remaining) {
   /* Make sure to reset the idle timer, to prevent ProFTPD from timing out
    * the session.
    */
-  pr_timer_reset(PR_TIMER_IDLE, ANY_MODULE);
+  res = pr_timer_reset(PR_TIMER_IDLE, ANY_MODULE);
+  if (res < 0) {
+    pr_trace_msg(trace_channel, 15,
+      "error resetting TimeoutIdle timer: %s", strerror(errno));
+  }
 
   /* AND write something on the control connection, to prevent any middleboxes
    * from timing out the session.
@@ -1344,8 +1356,7 @@ static modret_t *digest_xcmd(cmd_rec *cmd, unsigned long algo) {
     if (get_algo_md(algo) != NULL) {
       char *hex_digest;
 
-      pr_response_add(R_250, _("%s: Computing %s digest"),
-        (char *) cmd->argv[0], get_algo_name(algo, 0));
+      pr_response_add(R_250, _("Computing %s digest"), get_algo_name(algo, 0));
       hex_digest = get_digest(cmd, algo, path, st.st_mtime, start_pos, len,
         PR_STR_FL_HEX_USE_UC, digest_progress_cb);
       if (hex_digest != NULL) {
