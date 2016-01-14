@@ -35,6 +35,9 @@
 #ifndef C_HASH
 # define C_HASH		"HASH"
 #endif
+#ifndef C_MD5
+# define C_MD5		"MD5"
+#endif
 #ifndef C_XCRC
 # define C_XCRC		"XCRC"
 #endif
@@ -54,6 +57,10 @@
 # define C_XSHA512	"XSHA512"
 #endif
 
+/* Non-standard FTP response/status codes */
+#ifndef R_251
+# define R_251		"251"
+#endif
 #ifndef R_556
 # define R_556		"556"
 #endif
@@ -431,6 +438,7 @@ static void digest_x_feat_add(pool *p) {
   }
 
   if (digest_algos & DIGEST_ALGO_MD5) {
+    pr_feat_add(C_MD5);
     pr_feat_add(C_XMD5);
   }
 
@@ -454,6 +462,7 @@ static void digest_x_help_add(pool *p) {
   }
 
   if (digest_algos & DIGEST_ALGO_MD5) {
+    pr_help_add(C_MD5, _("<sp> pathname"), TRUE);
     pr_help_add(C_XMD5, _("<sp> pathname [<sp> start <sp> end]"), TRUE);
   }
 
@@ -1457,7 +1466,7 @@ MODRET digest_hash(cmd_rec *cmd) {
   pr_trace_msg(trace_channel, 14, "%s: using %s algorithm on path '%s'",
     (char *) cmd->argv[0], get_algo_name(digest_hash_algo, 0), path);
 
-  pr_response_add(R_213, _("%s: Computing %s digest"), (char *) cmd->argv[0],
+  pr_response_add(R_213, _("Computing %s digest"),
     get_algo_name(digest_hash_algo, DIGEST_ALGO_FL_IANA_STYLE));
   hex_digest = get_digest(cmd, digest_hash_algo, path, st.st_mtime, start_pos,
     len, PR_STR_FL_HEX_USE_LC, digest_progress_cb);
@@ -1982,6 +1991,121 @@ MODRET digest_post_pass(cmd_rec *cmd) {
   return PR_DECLINED(cmd);
 }
 
+MODRET digest_md5(cmd_rec *cmd) {
+  int xerrno = 0;
+  char *error_code = NULL, *orig_path = NULL, *path = NULL, *hex_digest = NULL;
+  struct stat st;
+  off_t len, start_pos, end_pos;
+  unsigned long algo = DIGEST_ALGO_MD5;
+
+  if (digest_engine == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  if (!(digest_algos & algo)) {
+    pr_log_debug(DEBUG9, MOD_DIGEST_VERSION
+      ": unable to handle %s command: MD5 disabled by DigestAlgorithms",
+      (char *) cmd->argv[0]);
+    return PR_DECLINED(cmd);
+  }
+
+  CHECK_CMD_MIN_ARGS(cmd, 2);
+
+  orig_path = pr_fs_decode_path(cmd->tmp_pool, cmd->arg);
+  path = dir_realpath(cmd->tmp_pool, orig_path);
+  if (path == NULL) {
+    xerrno = errno;
+
+    pr_response_add_err(R_550, "%s: %s", orig_path, strerror(xerrno));
+
+    pr_cmd_set_errno(cmd, xerrno);
+    errno = xerrno;
+    return PR_ERROR(cmd);
+  }
+
+  if (blacklisted_file(path) == TRUE) {
+    pr_log_debug(DEBUG8, MOD_DIGEST_VERSION
+      ": rejecting request to checksum blacklisted special file '%s'", path);
+    pr_response_add_err(R_550, "%s: %s", (char *) cmd->arg, strerror(EPERM));
+    pr_cmd_set_errno(cmd, EPERM);
+    errno = EPERM;
+    return PR_ERROR(cmd);
+  }
+
+  if (!dir_check(cmd->tmp_pool, cmd, cmd->group, path, NULL)) {
+    xerrno = EPERM;
+
+    pr_log_debug(DEBUG8, MOD_DIGEST_VERSION
+      ": %s denied by <Limit> configuration", (char *) cmd->argv[0]);
+    pr_response_add_err(R_550, "%s: %s", orig_path, strerror(xerrno));
+
+    pr_cmd_set_errno(cmd, xerrno);
+    errno = xerrno;
+    return PR_ERROR(cmd);
+  }
+
+  pr_fs_clear_cache2(path);
+  if (pr_fsio_stat(path, &st) < 0) {
+    xerrno = errno;
+
+    pr_response_add_err(R_550, "%s: %s", orig_path, strerror(xerrno));
+
+    pr_cmd_set_errno(cmd, xerrno);
+    errno = xerrno;
+    return PR_ERROR(cmd);
+  }
+
+  if (!S_ISREG(st.st_mode)) {
+    pr_log_debug(DEBUG5, MOD_DIGEST_VERSION
+      ": unable to handle %s for non-file path '%s'", (char *) cmd->argv[0],
+      path);
+    pr_response_add_err(R_504, _("%s: Not a regular file"), orig_path);
+    return PR_ERROR(cmd);
+  }
+
+  start_pos = 0;
+  end_pos = st.st_size;
+  len = end_pos - start_pos;
+
+  if (check_digest_max_size(len) < 0) {
+    pr_response_add_err(R_550, "%s: %s", orig_path, strerror(EPERM));
+    pr_cmd_set_errno(cmd, EPERM);
+    errno = EPERM;
+    return PR_ERROR(cmd);
+  }
+
+  pr_trace_msg(trace_channel, 14, "%s: using %s algorithm on path '%s'",
+    (char *) cmd->argv[0], get_algo_name(algo, 0), path);
+
+  pr_response_add(R_251, _("Computing %s digest"), get_algo_name(algo, 0));
+  hex_digest = get_digest(cmd, algo, path, st.st_mtime, start_pos,
+    len, PR_STR_FL_HEX_USE_UC, digest_progress_cb);
+  xerrno = errno;
+
+  if (hex_digest != NULL) {
+    pr_response_add(R_DUP, "%s %s", orig_path, hex_digest);
+    return PR_HANDLED(cmd);
+  }
+
+  switch (xerrno) {
+    case EISDIR:
+      /* The MD5 draft recommends using 504 for these cases. */
+      error_code = R_504;
+      break;
+
+    default:
+      error_code = R_550;
+      break;
+  }
+
+  /* TODO: More detailed error message? */
+  pr_response_add_err(error_code, "%s: %s", orig_path, strerror(xerrno));
+
+  pr_cmd_set_errno(cmd, xerrno);
+  errno = xerrno;
+  return PR_ERROR(cmd);
+}
+
 MODRET digest_xcrc(cmd_rec *cmd) {
   unsigned long algo = DIGEST_ALGO_CRC32;
 
@@ -2224,6 +2348,7 @@ static cmdtable digest_cmdtab[] = {
   { CMD, C_HASH,	G_READ, digest_hash,	TRUE, FALSE, CL_READ|CL_INFO },
   { CMD, C_OPTS"_HASH",	G_NONE,	digest_opts_hash,FALSE,FALSE },
 
+  { CMD, C_MD5,		G_READ, digest_md5,	TRUE, FALSE, CL_READ|CL_INFO },
   { CMD, C_XCRC,	G_READ, digest_xcrc,	TRUE, FALSE, CL_READ|CL_INFO },
   { CMD, C_XMD5,	G_READ, digest_xmd5,	TRUE, FALSE, CL_READ|CL_INFO },
   { CMD, C_XSHA,	G_READ, digest_xsha1,	TRUE, FALSE, CL_READ|CL_INFO },
