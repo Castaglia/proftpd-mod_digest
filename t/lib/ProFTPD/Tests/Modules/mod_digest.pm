@@ -221,7 +221,7 @@ my $TESTS = {
 
   digest_config_engine_per_user => {
     order => ++$order,
-    test_class => [qw(forking)],
+    test_class => [qw(forking mod_ifsession)],
   },
 
   digest_config_max_size => {
@@ -1893,7 +1893,7 @@ sub digest_xcrc_2gb {
     ScoreboardFile => $setup->{scoreboard_file},
     SystemLog => $setup->{log_file},
     TraceLog => $setup->{log_file},
-    Trace => 'digest:20',
+    Trace => 'digest:20 timer:20',
 
     AuthUserFile => $setup->{auth_user_file},
     AuthGroupFile => $setup->{auth_group_file},
@@ -3232,7 +3232,7 @@ sub digest_caching_max_size {
     ScoreboardFile => $setup->{scoreboard_file},
     SystemLog => $setup->{log_file},
     TraceLog => $setup->{log_file},
-    Trace => 'digest:20',
+    Trace => 'digest:20 timer:20',
 
     AuthUserFile => $setup->{auth_user_file},
     AuthGroupFile => $setup->{auth_group_file},
@@ -3277,10 +3277,7 @@ sub digest_caching_max_size {
       # caching of results.  After each command, we "touch" the file to
       # change its mtime, meaning a new cache entry.
       my ($resp_code, $resp_msg) = $client->quote('XCRC', 'test.txt');
-
-      my $expected;
-
-      $expected = 250;
+      my $expected = 250;
       $self->assert($expected == $resp_code,
         test_msg("Expected response code $expected, got $resp_code"));
 
@@ -3296,7 +3293,6 @@ sub digest_caching_max_size {
       }
 
       ($resp_code, $resp_msg) = $client->quote('XCRC', 'test.txt');
-
       $expected = 250;
       $self->assert($expected == $resp_code,
         test_msg("Expected response code $expected, got $resp_code"));
@@ -3357,7 +3353,7 @@ sub digest_caching_max_size {
     $wfh->flush();
 
   } else {
-    eval { server_wait($setup->{config_file}, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh, 300) };
     if ($@) {
       warn($@);
       exit 1;
