@@ -586,6 +586,26 @@ MODRET set_digestcache(cmd_rec *cmd) {
   return PR_HANDLED(cmd);
 }
 
+/* usage: DigestEnable on|off */
+MODRET set_digestenable(cmd_rec *cmd) {
+  int enable = -1;
+  config_rec *c;
+
+  CHECK_ARGS(cmd, 1);
+  CHECK_CONF(cmd, CONF_DIR|CONF_DYNDIR);
+
+  enable = get_boolean(cmd, 1);
+  if (enable == -1) {
+    CONF_ERROR(cmd, "expected Boolean parameter");
+  }
+
+  c = add_config_param(cmd->argv[0], 1, NULL);
+  c->argv[0] = palloc(c->pool, sizeof(int));
+  *((int *) c->argv[0]) = enable;
+
+  return PR_HANDLED(cmd);
+}
+
 /* usage: DigestEngine on|off */
 MODRET set_digestengine(cmd_rec *cmd) {
   int engine = -1;
@@ -691,8 +711,10 @@ static int check_digest_max_size(off_t len) {
   return 0;
 }
 
-static int check_file(pool *p, const char *path, off_t start, size_t len,
+static int can_digest_file(pool *p, const char *path, off_t start, size_t len,
     struct stat *st) {
+  config_rec *d;
+  char *dir_path, *ptr;
 
   if (!S_ISREG(st->st_mode)) {
     pr_trace_msg(trace_channel, 2, "path '%s' is not a regular file", path);
@@ -718,6 +740,44 @@ static int check_file(pool *p, const char *path, off_t start, size_t len,
         (unsigned long) len, path, (unsigned long) st->st_size);
       errno = EINVAL;
       return -1;
+    }
+  }
+
+  /* Check for the "DigestEnable off" for the directory containing this file.
+   * Make sure we check any possible .ftpaccess files in the directory which
+   * might themselves contain a DigestEnable configuration.
+   */
+  ptr = strrchr(path, '/');
+  if (ptr == NULL ||
+      ptr == path) {
+    /* Note that this check for the last '/' character should NEVER fail; we
+     * should always be given the full path here.
+     *
+     * Also, if not NULL, the last '/' should NEVER be the first character in
+     * the given path, as it means the path is a directory, and that case
+     * should be already handled/avoided above.
+     */
+    return 0;
+  }
+
+  dir_path = pstrndup(p, path, (ptr - path));
+
+  pr_trace_msg(trace_channel, 1, "checking for DigestEnable in '%s'", dir_path);
+  d = dir_match_path(p, dir_path);
+  if (d != NULL) {
+    config_rec *c;
+
+    c = find_config(d->subset, CONF_PARAM, "DigestEnable", FALSE);
+    if (c != NULL) {
+      int digest_enable;
+
+      digest_enable = *((int *) c->argv[0]);
+      if (digest_enable == FALSE) {
+        pr_log_debug(DEBUG8, MOD_DIGEST_VERSION
+          ": digest of '%s' denied by DigestEnable configuration", path);
+        errno = EPERM;
+        return -1;
+      }
     }
   }
 
@@ -775,7 +835,7 @@ static int compute_digest(pool *p, const char *path, off_t start, off_t len,
     return -1;
   }
 
-  res = check_file(p, path, start, len, &st);
+  res = can_digest_file(p, path, start, len, &st);
   if (res < 0) {
     xerrno = errno;
     (void) pr_fsio_close(fh);
@@ -1191,10 +1251,12 @@ static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
 
   res = compute_digest(cmd->tmp_pool, path, start, len, md, digest,
     &digest_len, &mtime, hash_progress_cb);
-  if (res == 0) {
-    hex_digest = pr_str_bin2hex(cmd->tmp_pool, digest, digest_len,
-      PR_STR_FL_HEX_USE_LC);
+  if (res < 0) {
+    return NULL;
   }
+
+  hex_digest = pr_str_bin2hex(cmd->tmp_pool, digest, digest_len,
+    PR_STR_FL_HEX_USE_LC);
 
   if (add_cached_digest(cmd->tmp_pool, algo, path, mtime, start, len,
       hex_digest) < 0) {
@@ -1491,6 +1553,11 @@ MODRET digest_hash(cmd_rec *cmd) {
     case EISDIR:
       /* The HASH draft recommends using 553 for these cases. */
       error_code = R_553;
+      break;
+
+    case EPERM:
+      /* This can happen if the directory is blocked via "DigestEnable off". */
+      error_code = R_552;
       break;
 
     default:
@@ -2375,6 +2442,7 @@ static cmdtable digest_cmdtab[] = {
 static conftable digest_conftab[] = {
   { "DigestAlgorithms",	set_digestalgorithms,	NULL },
   { "DigestCache",	set_digestcache,	NULL },
+  { "DigestEnable",	set_digestenable,	NULL },
   { "DigestEngine",	set_digestengine,	NULL },
   { "DigestMaxSize",	set_digestmaxsize,	NULL },
   { "DigestOptions",	set_digestoptions,	NULL },
