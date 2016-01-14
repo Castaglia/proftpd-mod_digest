@@ -144,7 +144,7 @@ static unsigned long digest_hash_algo = DIGEST_ALGO_SHA1;
  * loop when digesting a file.
  */
 #ifndef DIGEST_PROGRESS_NTH_ITER
-# define DIGEST_PROGRESS_NTH_ITER	10000
+# define DIGEST_PROGRESS_NTH_ITER	50000
 #endif
 
 static const char *trace_channel = "digest";
@@ -1211,7 +1211,7 @@ static void digest_progress_cb(const char *path, off_t remaining) {
   /* AND write something on the control connection, to prevent any middleboxes
    * from timing out the session.
    */
-  pr_response_add(R_DUP, _("Calculating..."));
+  pr_response_add(R_DUP, _("Computing..."));
 }
 
 static modret_t *digest_xcmd(cmd_rec *cmd, unsigned long algo) {
@@ -1343,7 +1343,7 @@ static modret_t *digest_xcmd(cmd_rec *cmd, unsigned long algo) {
     if (get_algo_md(algo) != NULL) {
       char *hex_digest;
 
-      pr_response_add(R_250, _("%s: Calculating %s digest"),
+      pr_response_add(R_250, _("%s: Computing %s digest"),
         (char *) cmd->argv[0], get_algo_name(algo, 0));
       hex_digest = get_digest(cmd, algo, path, st.st_mtime, start_pos, len,
         PR_STR_FL_HEX_USE_UC, digest_progress_cb);
@@ -1445,7 +1445,7 @@ MODRET digest_hash(cmd_rec *cmd) {
   pr_trace_msg(trace_channel, 14, "%s: using %s algorithm on path '%s'",
     (char *) cmd->argv[0], get_algo_name(digest_hash_algo, 0), path);
 
-  pr_response_add(R_213, _("%s: Calculating %s digest"), (char *) cmd->argv[0],
+  pr_response_add(R_213, _("%s: Computing %s digest"), (char *) cmd->argv[0],
     get_algo_name(digest_hash_algo, DIGEST_ALGO_FL_IANA_STYLE));
   hex_digest = get_digest(cmd, digest_hash_algo, path, st.st_mtime, start_pos,
     len, PR_STR_FL_HEX_USE_LC, digest_progress_cb);

@@ -84,6 +84,11 @@ my $TESTS = {
     test_class => [qw(forking)],
   },
 
+  digest_xcrc_2gb => {
+    order => ++$order,
+    test_class => [qw(forking slow)],
+  },
+
   digest_xmd5 => {
     order => ++$order,
     test_class => [qw(forking)],
@@ -228,14 +233,6 @@ my $TESTS = {
     order => ++$order,
     test_class => [qw(forking mod_ifsession)],
   },
-
-  # XXX TODO:
-  #
-  #  requested range (if supported) invalid:
-  #    length too long
-  #
-  #  periodic 213 responses for LARGE file
-  #  crc32 on >2GB file
 
 };
 
@@ -1820,6 +1817,149 @@ sub digest_xcrc {
 
   } else {
     eval { server_wait($setup->{config_file}, $rfh) };
+    if ($@) {
+      warn($@);
+      exit 1;
+    }
+
+    exit 0;
+  }
+
+  # Stop server
+  server_stop($setup->{pid_file});
+  $self->assert_child_ok($pid);
+
+  test_cleanup($setup->{log_file}, $ex);
+}
+
+sub digest_xcrc_2gb {
+  my $self = shift;
+  my $tmpdir = $self->{tmpdir};
+  my $setup = test_setup($tmpdir, 'digest');
+
+  require Digest::CRC;
+
+  my $test_file = File::Spec->rel2abs("$tmpdir/test.dat");
+  if (open(my $fh, "> $test_file")) {
+    if ($ENV{TEST_VERBOSE}) {
+      print STDERR "# Creating 2GB+ file\n";
+    }
+
+    # Create a file which is a little larger than 2GB.
+    #
+    # Seek to the 2GB limit, then fill the rest with 'A'
+    unless (seek($fh, (2 ** 31), 0)) {
+       die("Can't seek to 2GB length: $!");
+    }
+
+    print $fh "A" x 326;
+
+    unless (close($fh)) {
+      die("Can't write $test_file: $!");
+    }
+
+  } else {
+    die("Can't open $test_file: $!");
+  }
+
+  my $expected_digest = 'DB21A206';
+
+  # WARNING: it can take a long time for Digest::CRC to grovel through
+  # a 2GB file.
+  my $compute_digest = 0;
+
+  if ($compute_digest) {
+    if (open(my $fh, "< $test_file")) {
+      my $ctx = Digest::CRC->new(type => 'crc32');
+
+      if ($ENV{TEST_VERBOSE}) {
+        print STDERR "# Digesting 2GB+ file\n";
+      }
+      $ctx->addfile($fh);
+      $expected_digest = uc($ctx->hexdigest);
+      close($fh);
+
+      if ($ENV{TEST_VERBOSE}) {
+        print STDERR "# Computed CRC32 digest: $expected_digest\n";
+      }
+
+    } else {
+      die("Can't read $test_file: $!");
+    }
+  }
+
+  my $config = {
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
+    Trace => 'digest:20',
+
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+
+    IfModules => {
+      'mod_delay.c' => {
+        DelayEngine => 'off',
+      },
+
+      'mod_digest.c' => {
+        DigestEngine => 'on',
+      },
+    },
+  };
+
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
+
+  # Open pipes, for use between the parent and child processes.  Specifically,
+  # the child will indicate when it's done with its test by writing a message
+  # to the parent.
+  my ($rfh, $wfh);
+  unless (pipe($rfh, $wfh)) {
+    die("Can't open pipe: $!");
+  }
+
+  my $ex;
+
+  # Fork child
+  $self->handle_sigchld();
+  defined(my $pid = fork()) or die("Can't fork: $!");
+  if ($pid) {
+    eval {
+      # Allow server to start up
+      sleep(1);
+
+      my $client = ProFTPD::TestSuite::FTP->new('127.0.0.1', $port, 0, 1);
+      $client->login($setup->{user}, $setup->{passwd});
+      $client->quote('XCRC', 'test.dat');
+
+      my $resp_code = $client->response_code();
+      my $resp_msgs = $client->response_msgs();
+      $client->quit();
+
+      my $expected;
+
+      $expected = 250;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      my $nresp_msgs = scalar(@$resp_msgs);
+      my $last_resp_msg = $resp_msgs->[$nresp_msgs-1];
+      $expected = $expected_digest;
+      $self->assert($expected eq $last_resp_msg,
+        test_msg("Expected response message '$expected', got '$last_resp_msg'"));
+    };
+
+    if ($@) {
+      $ex = $@;
+    }
+
+    $wfh->print("done\n");
+    $wfh->flush();
+
+  } else {
+    eval { server_wait($setup->{config_file}, $rfh, 3600) };
     if ($@) {
       warn($@);
       exit 1;
