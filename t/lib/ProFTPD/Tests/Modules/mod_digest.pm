@@ -5901,7 +5901,7 @@ sub digest_config_max_size {
 
       'mod_digest.c' => {
         DigestEngine => 'on',
-        DigestMaxSize => 2,
+        DigestMaxSize => '2 B',
       },
     },
   };

@@ -167,16 +167,28 @@ If the parameter is <em>off</em>, then these commands will be ignored.
 <p>
 <hr>
 <h3><a name="DigestMaxSize">DigestMaxSize</a></h3>
-<strong>Syntax:</strong> DigestMaxSize <em>number</em><br>
+<strong>Syntax:</strong> DigestMaxSize <em>number [units]</em><br>
 <strong>Default:</strong> None<br>
 <strong>Context:</strong> server config, &lt;VirtualHost&gt;, &lt;Global&gt;, &lt;Anonymous&gt;<br>
 <strong>Module:</strong> mod_digest<br>
 <strong>Compatibility:</strong> 1.3.6rc2 or later
 
 <p>
-The <code>DigestMaxSize</code> directive configures the maximum number of bytes a single hash command is allowed to read from a file.
-If the number of bytes to be read from the file is greater than the configured limit the server will return an error.
-If no <code>DigestMaxSize</code> directive is configured, then there is no limit. It is stronly recommended to set an upper limit.
+The <code>DigestMaxSize</code> directive configures the maximum number of bytes
+a single hash command is allowed to read from a file.  If the number of bytes
+to be read from the file is greater than the configured <em>number</em> the
+server will refuse that command.
+
+<p>
+If no <code>DigestMaxSize</code> directive is configured, then there is no
+limit. It is highly <b>recommended</b> to set an upper limit.
+
+<p>
+Example:
+<pre>
+  # Limit hashing to 1GB of data
+  DigestMaxSize 1 GB
+</pre>
 
 <p>
 <hr>

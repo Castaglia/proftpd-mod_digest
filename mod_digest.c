@@ -630,21 +630,33 @@ MODRET set_digestengine(cmd_rec *cmd) {
 /* usage: DigestMaxSize len */
 MODRET set_digestmaxsize(cmd_rec *cmd) {
   config_rec *c = NULL;
-  char *ptr = NULL;
+  const char *num, *units = "";
   off_t max_size;
 
-  CHECK_ARGS(cmd, 1);
+  if (cmd->argc < 2 ||
+      cmd->argc > 3) {
+    CONF_ERROR(cmd, "wrong number of parameters");
+  }
+
   CHECK_CONF(cmd, CONF_ROOT|CONF_GLOBAL|CONF_VIRTUAL|CONF_ANON);
 
-#ifdef HAVE_STRTOULL
-  max_size = strtoull(cmd->argv[1], &ptr, 10);
-#else
-  max_size = strtoul(cmd->argv[1], &ptr, 10);
-#endif /* HAVE_STRTOULL */
+  /* Handle "DigestMaxSize none|off" by using a value of zero. */
+  if (cmd->argc == 2 &&
+      get_boolean(cmd, 1) == FALSE) {
+    c = add_config_param(cmd->argv[0], 1, NULL);
+    c->argv[0] = pcalloc(c->pool, sizeof(off_t));
+    c->flags |= CF_MERGEDOWN;
+    return PR_HANDLED(cmd);
+  }
 
-  if (ptr && *ptr) {
+  num = cmd->argv[1];
+  if (cmd->argc == 3) {
+    units = cmd->argv[2];
+  }
+
+  if (pr_str_get_nbytes(num, units, &max_size) < 0) {
     CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "badly formatted size value: ",
-      cmd->argv[1], NULL));
+      num, units, NULL));
   }
 
   if (max_size == 0) {
@@ -699,6 +711,10 @@ static int check_digest_max_size(off_t len) {
   }
 
   max_size = *((off_t *) c->argv[0]);
+  if (max_size == 0) {
+    /* Special sentinel value to "disable" any inherited configs. */
+    return 0;
+  }
 
   if (len > max_size) {
     pr_log_debug(DEBUG5, MOD_DIGEST_VERSION
