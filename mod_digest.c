@@ -1210,6 +1210,7 @@ static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
   unsigned int digest_len;
   char *hex_digest;
   size_t cache_size;
+  const char *algo_name;
 
   /* Note: if caching is disabled, this condition will never be true. */
   cache_size = get_cache_size();
@@ -1228,12 +1229,32 @@ static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
       "refusing %s command", (unsigned long) cache_size,
       (unsigned long) digest_cache_max_size, (char *) cmd->argv[0]);
 
+    /* Generate an event, for benefit of any possible listeners
+     * (e.g. mod_ban).
+     */
+    pr_event_generate("mod_digest.max-cache-size", NULL);
+
     errno = xerrno;
     return NULL;
   }
 
   hex_digest = get_cached_digest(cmd->tmp_pool, algo, path, mtime, start, len);
   if (hex_digest != NULL) {
+    /* Stash the algorith name, and digest, as notes. */
+
+    algo_name = get_algo_name(algo, 0);
+    if (pr_table_add(cmd->notes, "mod_digest.algo",
+        pstrdup(cmd->pool, algo_name), 0) <  0) {
+      pr_trace_msg(trace_channel, 3,
+        "error adding 'mod_digest.algo' note: %s", strerror(errno));
+    }
+
+    if (pr_table_add(cmd->notes, "mod_digest.digest",
+        pstrdup(cmd->pool, hex_digest), 0) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error adding 'mod_digest.digest' note: %s", strerror(errno));
+    }
+
     if (flags & PR_STR_FL_HEX_USE_UC) {
       register unsigned int i;
 
@@ -1263,6 +1284,21 @@ static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
     pr_trace_msg(trace_channel, 8,
       "error caching %s digest for path '%s': %s", get_algo_name(algo, 0),
       path, strerror(errno));
+  }
+
+  /* Stash the algorith name, and digest, as notes. */
+
+  algo_name = get_algo_name(algo, 0);
+  if (pr_table_add(cmd->notes, "mod_digest.algo",
+      pstrdup(cmd->pool, algo_name), 0) <  0) {
+    pr_trace_msg(trace_channel, 3,
+      "error adding 'mod_digest.algo' note: %s", strerror(errno));
+  }
+
+  if (pr_table_add(cmd->notes, "mod_digest.digest",
+      pstrdup(cmd->pool, hex_digest), 0) < 0) {
+    pr_trace_msg(trace_channel, 3,
+      "error adding 'mod_digest.digest' note: %s", strerror(errno));
   }
 
   if (flags & PR_STR_FL_HEX_USE_UC) {
