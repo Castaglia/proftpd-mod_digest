@@ -598,6 +598,10 @@ MODRET set_digestcache(cmd_rec *cmd) {
       long size;
       char *ptr = NULL;
 
+      if (i+1 == cmd->argc) {
+        CONF_ERROR(cmd, "wrong number of parameters");
+      }
+
       size = strtol(cmd->argv[i+1], &ptr, 10);
       if (ptr && *ptr) {
         CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "invalid cache size: ",
@@ -613,6 +617,10 @@ MODRET set_digestcache(cmd_rec *cmd) {
 
     } else if (strncasecmp(cmd->argv[i], "maxAge", 7) == 0) {
       int max_age;
+
+      if (i+1 == cmd->argc) {
+        CONF_ERROR(cmd, "wrong number of parameters");
+      }
 
       if (pr_str_get_duration(cmd->argv[i+1], &max_age) < 0) {
         CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "invalid max age: ",
