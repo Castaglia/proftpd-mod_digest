@@ -32,9 +32,6 @@ to enable the features and set the <a href="#DigestMaxSize">DigestMaxSize</a>
 configuration directive appropriately.
 
 <p>
-It's also recommended to disable all features within the &lt;Anonymous&gt; context.
-
-<p>
 This module was compiled and tested against ProFTPD 1.3.3 Installation
 instructions are discussed <a href="#Installation">here</a>.
 
@@ -283,6 +280,15 @@ docs on extensions)
 
 validating uploads AND downloads (did I download everything?  Did the upload
 succeed?)
+
+<p>
+It's also recommended to disable all features within the &lt;Anonymous&gt; context.  How?
+
+  <Anonymous>
+    <IfModule mod_digest.c>
+      DigestEngine off
+    </IfModule>
+  </Anonymous>
 
 <p>
 <b>Supported FTP Commands</b><br>
