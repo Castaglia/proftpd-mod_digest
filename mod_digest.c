@@ -85,7 +85,11 @@ static int digest_caching = TRUE;
 #ifndef DIGEST_CACHE_DEFAULT_SIZE
 # define DIGEST_CACHE_DEFAULT_SIZE	10000
 #endif
-static size_t digest_cache_max_size = DIGEST_CACHE_DEFAULT_SIZE;
+#ifndef DIGEST_CACHE_DEFAULT_MAX_AGE
+# define DIGEST_CACHE_DEFAULT_MAX_AGE	30
+#endif
+static unsigned int digest_cache_max_size = DIGEST_CACHE_DEFAULT_SIZE;
+static unsigned int digest_cache_max_age = DIGEST_CACHE_DEFAULT_MAX_AGE;
 
 static EVP_MD_CTX *digest_cache_xfer_ctx = NULL;
 
@@ -548,41 +552,86 @@ MODRET set_digestalgorithms(cmd_rec *cmd) {
   return PR_HANDLED(cmd);
 }
 
-/* usage: DigestCache on|off|size */
+/* usage: DigestCache on|off|"size" count ["maxAge" age] */
 MODRET set_digestcache(cmd_rec *cmd) {
+  register unsigned int i;
   config_rec *c;
-  int caching = -1;
-  size_t max_size = DIGEST_CACHE_DEFAULT_SIZE;
 
-  CHECK_ARGS(cmd, 1);
-  CHECK_CONF(cmd, CONF_ROOT|CONF_GLOBAL|CONF_VIRTUAL|CONF_ANON);
-
-  caching = get_boolean(cmd, 1);
-  if (caching == -1) {
-    long size;
-    char *ptr = NULL;
-
-    size = strtol(cmd->argv[1], &ptr, 10);
-    if (ptr && *ptr) {
-      CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "invalid cache size: ",
-        cmd->argv[1], NULL));
-    }
-
-    if (size < 1) {
-      CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "cache size must be > 0"));
-    }
-
-    caching = TRUE;
-    max_size = size;
+  if (cmd->argc < 2 ||
+      cmd->argc > 5) {
+    CONF_ERROR(cmd, "wrong number of parameters");
   }
 
-  c = add_config_param(cmd->argv[0], 2, NULL, NULL);
-  c->argv[0] = palloc(c->pool, sizeof(int));
-  *((int *) c->argv[0]) = caching;
-  c->argv[1] = palloc(c->pool, sizeof(size_t));
-  *((size_t *) c->argv[1]) = max_size;
+  CHECK_CONF(cmd, CONF_ROOT|CONF_GLOBAL|CONF_VIRTUAL|CONF_ANON);
 
+  if (cmd->argc == 2) {
+    int caching = -1;
+
+    caching = get_boolean(cmd, 1);
+    if (caching == -1) {
+      CONF_ERROR(cmd, "expected Boolean parameter");
+    }
+
+    c = add_config_param(cmd->argv[0], 3, NULL, NULL, NULL);
+    c->argv[0] = palloc(c->pool, sizeof(int));
+    *((int *) c->argv[0]) = caching;
+    c->argv[1] = palloc(c->pool, sizeof(unsigned int));
+    *((unsigned int *) c->argv[1]) = DIGEST_CACHE_DEFAULT_SIZE;
+    c->argv[2] = palloc(c->pool, sizeof(unsigned int));
+    *((unsigned int *) c->argv[2]) = DIGEST_CACHE_DEFAULT_MAX_AGE;
+    c->flags |= CF_MERGEDOWN;
+
+    return PR_HANDLED(cmd);
+  }
+
+  c = add_config_param(cmd->argv[0], 3, NULL, NULL);
+  c->argv[0] = palloc(c->pool, sizeof(int));
+  *((int *) c->argv[0]) = TRUE;
+  c->argv[1] = palloc(c->pool, sizeof(unsigned int));
+  *((unsigned int *) c->argv[1]) = DIGEST_CACHE_DEFAULT_SIZE;
+  c->argv[2] = palloc(c->pool, sizeof(unsigned int));
+  *((unsigned int *) c->argv[2]) = DIGEST_CACHE_DEFAULT_MAX_AGE;
   c->flags |= CF_MERGEDOWN;
+
+  for (i = 1; i < cmd->argc; i++) {
+    if (strncasecmp(cmd->argv[i], "size", 5) == 0) {
+      long size;
+      char *ptr = NULL;
+
+      size = strtol(cmd->argv[i+1], &ptr, 10);
+      if (ptr && *ptr) {
+        CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "invalid cache size: ",
+          cmd->argv[i+1], NULL));
+      }
+
+      if (size < 1) {
+        CONF_ERROR(cmd, "cache size must be greater than 0");
+      }
+
+      *((unsigned int *) c->argv[1]) = (unsigned int) size;
+      i++;
+
+    } else if (strncasecmp(cmd->argv[i], "maxAge", 7) == 0) {
+      int max_age;
+
+      if (pr_str_get_duration(cmd->argv[i+1], &max_age) < 0) {
+        CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "invalid max age: ",
+          cmd->argv[i+1], NULL));
+      }
+
+      if (max_age < 1) {
+        CONF_ERROR(cmd, "maxAge parameter must be greater than 1");
+      }
+
+      *((unsigned int *) c->argv[2]) = max_age;
+      i++;
+
+    } else {
+      CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "unknown DigestCache parameter: ",
+        cmd->argv[i], NULL));
+    }
+  }
+
   return PR_HANDLED(cmd);
 }
 
@@ -1088,9 +1137,9 @@ static pr_table_t *get_cache(unsigned long algo) {
   return cache;
 }
 
-static size_t get_cache_size(void) {
+static unsigned int get_cache_size(void) {
   int res;
-  size_t cache_size = 0;
+  unsigned int cache_size = 0;
 
   if (digest_caching == FALSE) {
     return 0;
@@ -1174,6 +1223,26 @@ static char *get_cached_digest(pool *p, unsigned long algo, const char *path,
   val = pr_table_get(cache, key, NULL);
   if (val != NULL) {
     char *hex_digest;
+    time_t now;
+
+    /* We know that there's a key there; check to see if it should be
+     * expired.
+     */
+    time(&now);
+
+    if (now > (mtime + digest_cache_max_age)) {
+      pr_trace_msg(trace_channel, 12,
+        "cached digest for %s digest using key '%s' has expired, evicting",
+        algo_name, key);
+      if (pr_table_remove(cache, key, NULL) < 0) {
+        pr_trace_msg(trace_channel, 15,
+          "error removing key '%s' from %s cache: %s", key, algo_name,
+          strerror(errno));
+      }
+
+      errno = ENOENT;
+      return NULL;
+    }
 
     hex_digest = pstrdup(p, val);
     pr_trace_msg(trace_channel, 12,
@@ -1217,16 +1286,8 @@ static int add_cached_digest(pool *p, unsigned long algo, const char *path,
   return res;
 }
 
-static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
-    time_t mtime, off_t start, size_t len, int flags,
-    void (*hash_progress_cb)(const char *, off_t)) {
-  int res;
-  const EVP_MD *md;
-  unsigned char *digest = NULL;
-  unsigned int digest_len;
-  char *hex_digest;
-  size_t cache_size;
-  const char *algo_name;
+static int check_cache_size(cmd_rec *cmd) {
+  unsigned int cache_size;
 
   /* Note: if caching is disabled, this condition will never be true. */
   cache_size = get_cache_size();
@@ -1241,9 +1302,9 @@ static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
 #endif /* EBUSY */
 
     pr_log_debug(DEBUG5, MOD_DIGEST_VERSION
-      ": cache size (%lu) meets/exceeds max cache size (%lu), "
-      "refusing %s command", (unsigned long) cache_size,
-      (unsigned long) digest_cache_max_size, (char *) cmd->argv[0]);
+      ": cache size (%u) meets/exceeds max cache size (%u), "
+      "refusing %s command", cache_size, digest_cache_max_size,
+      (char *) cmd->argv[0]);
 
     /* Generate an event, for benefit of any possible listeners
      * (e.g. mod_ban).
@@ -1251,10 +1312,32 @@ static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
     pr_event_generate("mod_digest.max-cache-size", NULL);
 
     errno = xerrno;
+    return -1;
+  }
+
+  return 0;
+}
+
+static char *get_digest(cmd_rec *cmd, unsigned long algo, const char *path,
+    time_t mtime, off_t start, size_t len, int flags,
+    void (*hash_progress_cb)(const char *, off_t)) {
+  int res;
+  const EVP_MD *md;
+  unsigned char *digest = NULL;
+  unsigned int digest_len;
+  char *hex_digest;
+  const char *algo_name;
+
+  hex_digest = get_cached_digest(cmd->tmp_pool, algo, path, mtime, start, len);
+
+  /* We check the cache size AFTER looking for a cached value, as part of
+   * looking for a cached value involves expiring the cached values at
+   * lookup time.
+   */
+  if (check_cache_size(cmd) < 0) {
     return NULL;
   }
 
-  hex_digest = get_cached_digest(cmd->tmp_pool, algo, path, mtime, start, len);
   if (hex_digest != NULL) {
     /* Stash the algorith name, and digest, as notes. */
 
@@ -2104,7 +2187,10 @@ MODRET digest_post_pass(cmd_rec *cmd) {
   c = find_config(CURRENT_CONF, CONF_PARAM, "DigestCache", FALSE);
   if (c != NULL) {
     digest_caching = *((int *) c->argv[0]);
-    digest_cache_max_size = *((size_t *) c->argv[1]);
+    if (digest_caching == TRUE) {
+      digest_cache_max_size = *((unsigned int *) c->argv[1]);
+      digest_cache_max_age = *((unsigned int *) c->argv[2]);
+    }
   }
 
   return PR_DECLINED(cmd);
@@ -2348,9 +2434,10 @@ static void digest_sess_reinit_ev(const void *event_data, void *user_data) {
   pr_event_unregister(&digest_module, "core.session-reinit",
     digest_sess_reinit_ev);
 
-  digest_caching = TRUE;
   digest_engine = TRUE;
+  digest_caching = TRUE;
   digest_cache_max_size = DIGEST_CACHE_DEFAULT_SIZE;
+  digest_cache_max_age = DIGEST_CACHE_DEFAULT_MAX_AGE;
   digest_opts = DIGEST_DEFAULT_OPTS;
   digest_algos = DIGEST_DEFAULT_ALGOS;
   digest_hash_algo = DIGEST_ALGO_SHA1;
@@ -2428,7 +2515,10 @@ static int digest_sess_init(void) {
   c = find_config(main_server->conf, CONF_PARAM, "DigestCache", FALSE);
   if (c != NULL) {
     digest_caching = *((int *) c->argv[0]);
-    digest_cache_max_size = *((size_t *) c->argv[1]);
+    if (digest_caching == TRUE) {
+      digest_cache_max_size = *((unsigned int *) c->argv[1]);
+      digest_cache_max_age = *((unsigned int *) c->argv[2]);
+    }
   }
 
   c = find_config(main_server->conf, CONF_PARAM, "DigestOptions", FALSE);
