@@ -154,7 +154,12 @@ my $TESTS = {
     test_class => [qw(forking)],
   },
 
-  digest_caching_max_age => {
+  digest_caching_max_age_same_file => {
+    order => ++$order,
+    test_class => [qw(forking)],
+  },
+
+  digest_caching_max_age_different_file => {
     order => ++$order,
     test_class => [qw(forking)],
   },
@@ -3607,7 +3612,7 @@ sub digest_caching_max_size {
   test_cleanup($setup->{log_file}, $ex);
 }
 
-sub digest_caching_max_age {
+sub digest_caching_max_age_same_file {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
   my $setup = test_setup($tmpdir, 'digest');
@@ -3726,6 +3731,189 @@ sub digest_caching_max_age {
         test_msg("Expected response code $expected, got $resp_code"));
 
       $expected = $expected_digest;
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+    };
+
+    if ($@) {
+      $ex = $@;
+    }
+
+    $wfh->print("done\n");
+    $wfh->flush();
+
+  } else {
+    eval { server_wait($setup->{config_file}, $rfh, 300) };
+    if ($@) {
+      warn($@);
+      exit 1;
+    }
+
+    exit 0;
+  }
+
+  # Stop server
+  server_stop($setup->{pid_file});
+  $self->assert_child_ok($pid);
+
+  test_cleanup($setup->{log_file}, $ex);
+}
+
+sub digest_caching_max_age_different_file {
+  my $self = shift;
+  my $tmpdir = $self->{tmpdir};
+  my $setup = test_setup($tmpdir, 'digest');
+
+  require Digest::CRC;
+
+  my $test_file1 = File::Spec->rel2abs("$tmpdir/test1.txt");
+  if (open(my $fh, "> $test_file1")) {
+    print $fh "Hello, World!\n";
+    unless (close($fh)) {
+      die("Can't write $test_file1: $!");
+    }
+
+  } else {
+    die("Can't open $test_file1: $!");
+  }
+
+  my $expected_digest1;
+
+  if (open(my $fh, "< $test_file1")) {
+    my $ctx = Digest::CRC->new(type => 'crc32');
+    $ctx->addfile($fh);
+    $expected_digest1 = uc($ctx->hexdigest);
+    close($fh);
+
+  } else {
+    die("Can't read $test_file1: $!");
+  }
+
+  my $test_file2 = File::Spec->rel2abs("$tmpdir/test2.txt");
+  if (open(my $fh, "> $test_file2")) {
+    print $fh "Hello, World!  It's me again.\n";
+    unless (close($fh)) {
+      die("Can't write $test_file2: $!");
+    }
+
+  } else {
+    die("Can't open $test_file2: $!");
+  }
+
+  my $expected_digest2;
+
+  if (open(my $fh, "< $test_file2")) {
+    my $ctx = Digest::CRC->new(type => 'crc32');
+    $ctx->addfile($fh);
+    $expected_digest2 = uc($ctx->hexdigest);
+    close($fh);
+
+  } else {
+    die("Can't read $test_file2: $!");
+  }
+
+  my $config = {
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
+    Trace => 'digest:20 timer:20',
+
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+
+    IfModules => {
+      'mod_delay.c' => {
+        DelayEngine => 'off',
+      },
+
+      'mod_digest.c' => {
+        DigestEngine => 'on',
+        DigestCache => 'size 1 maxAge 1s',
+      },
+    },
+  };
+
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
+
+  # Open pipes, for use between the parent and child processes.  Specifically,
+  # the child will indicate when it's done with its test by writing a message
+  # to the parent.
+  my ($rfh, $wfh);
+  unless (pipe($rfh, $wfh)) {
+    die("Can't open pipe: $!");
+  }
+
+  my $ex;
+
+  # Fork child
+  $self->handle_sigchld();
+  defined(my $pid = fork()) or die("Can't fork: $!");
+  if ($pid) {
+    eval {
+      # Allow server to start up
+      sleep(1);
+
+      my $client = ProFTPD::TestSuite::FTP->new('127.0.0.1', $port, 0, 1);
+      $client->login($setup->{user}, $setup->{passwd});
+
+      # We deliberately do this multiple times, to test the in-memory
+      # caching of results.
+      my ($resp_code, $resp_msg) = $client->quote('XCRC', 'test1.txt');
+      my $expected = 250;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = $expected_digest1;
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+
+      eval { $client->quote('XCRC', 'test2.txt') };
+      unless ($@) {
+        die("XCRC test2.txt succeeded unexpectedly");
+      }
+
+      $resp_code = $client->response_code();
+      $resp_msg = $client->response_msg();
+
+      $expected = 550;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = "test2.txt: Resource busy";
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+
+      # Now wait for longer than 5 secs, for the expiry timer to kick in.
+      my $delay = 6;
+      if ($ENV{TEST_VERBOSE}) {
+        print STDERR "# Sleeping for $delay secs\n";
+      }
+      sleep($delay);
+
+      ($resp_code, $resp_msg) = $client->quote('XCRC', 'test2.txt');
+      $resp_code = $client->response_code();
+      $resp_msg = $client->response_msg();
+
+      $expected = 250;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = $expected_digest2;
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+
+      sleep(1);
+      ($resp_code, $resp_msg) = $client->quote('XCRC', 'test2.txt');
+
+      $client->quit();
+
+      $expected = 250;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = $expected_digest2;
       $self->assert($expected eq $resp_msg,
         test_msg("Expected response message '$expected', got '$resp_msg'"));
     };

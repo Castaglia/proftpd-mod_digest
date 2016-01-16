@@ -117,6 +117,24 @@ static pr_table_t *digest_sha1_tab = NULL;
 static pr_table_t *digest_sha256_tab = NULL;
 static pr_table_t *digest_sha512_tab = NULL;
 
+/* Used for tracking the cache keys for expiring. */
+struct digest_cache_key {
+  struct digest_cache_key *next, *prev;
+  pool *pool;
+  unsigned long algo;
+  const char *path;
+  time_t mtime;
+  off_t start;
+  off_t len;
+  const char *key;
+  const char *hex_digest;
+};
+
+static xaset_t *digest_cache_keys = NULL;
+
+/* How often do we check for expired cache entries (in secs)? */
+#define DIGEST_CACHE_EXPIRY_INTVL		5
+
 /* Digest algorithms supported by mod_digest. */
 #define DIGEST_ALGO_CRC32		0x0001
 #ifndef OPENSSL_NO_MD5
@@ -218,9 +236,10 @@ static char *digest_bin2hex(pool *p, const unsigned char *buf, size_len,
 
 #define CRC32_BLOCK		4
 #define CRC32_DIGEST_LENGTH	4
+#define CRC32_TABLE_SIZE	256
 
 typedef struct crc32_ctx_st {
-  uint32_t crc32_table[256];
+  uint32_t *crc32_table;
   uint32_t data;
 } CRC32_CTX;
 
@@ -231,7 +250,13 @@ static int CRC32_Init(CRC32_CTX *ctx) {
    * polynomial used by CRC32 in PKZip.
    */
 
-  for (i = 0; i < sizeof(ctx->crc32_table); i++) {
+  ctx->crc32_table = malloc(sizeof(uint32_t) * CRC32_TABLE_SIZE);
+  if (ctx->crc32_table == NULL) {
+    errno = ENOMEM;
+    return 0;
+  }
+
+  for (i = 0; i < CRC32_TABLE_SIZE; i++) {
     register unsigned int j;
     uint32_t crc;
 
@@ -280,6 +305,15 @@ static int CRC32_Final(unsigned char *md, CRC32_CTX *ctx) {
   return 1;
 }
 
+static int CRC32_Free(CRC32_CTX *ctx) {
+  if (ctx->crc32_table != NULL) {
+    free(ctx->crc32_table);
+    ctx->crc32_table = NULL;
+  }
+
+  return 1;
+}
+
 static int crc32_init(EVP_MD_CTX *ctx) {
   return CRC32_Init(ctx->md_data);
 }
@@ -292,6 +326,10 @@ static int crc32_final(EVP_MD_CTX *ctx, unsigned char *md) {
   return CRC32_Final(md, ctx->md_data);
 }
 
+static int crc32_free(EVP_MD_CTX *ctx) {
+  return CRC32_Free(ctx->md_data);
+}
+
 static const EVP_MD crc32_md = {
   NID_undef,
   NID_undef,
@@ -301,7 +339,7 @@ static const EVP_MD crc32_md = {
   crc32_update,
   crc32_final,
   NULL,
-  NULL,
+  crc32_free,
   EVP_PKEY_NULL_method,
   CRC32_BLOCK,
   sizeof(EVP_MD *) + sizeof(CRC32_CTX)
@@ -1184,8 +1222,8 @@ static unsigned int get_cache_size(void) {
 /* Format the keys for the in-memory caches as:
  *  "<path>@<mtime>,<start>+<len>"
  */
-static const char *get_cache_key(pool *p, const char *path,
-    time_t mtime, off_t start, size_t len) {
+static const char *get_key_for_cache(pool *p, const char *path, time_t mtime,
+    off_t start, size_t len) {
   const char *key;
   char mtime_str[256], start_str[256], len_str[256];
 
@@ -1200,6 +1238,163 @@ static const char *get_cache_key(pool *p, const char *path,
 
   key = pstrcat(p, path, "@", mtime_str, ",", start_str, "+", len_str, NULL);
   return key;
+}
+
+/* Order items in the cache keys list by mtime, for easier/faster searching
+ * for the keys to expire.
+ */
+static int cache_key_cmp(xasetmember_t *a, xasetmember_t *b) {
+  struct digest_cache_key *k1, *k2;
+
+  k1 = (struct digest_cache_key *) a;
+  k2 = (struct digest_cache_key *) b;
+
+  if (k1->mtime < k2->mtime) {
+    return -1;
+  }
+
+  if (k1->mtime > k2->mtime) {
+    return 1;
+  }
+
+  return 0;
+}
+
+static struct digest_cache_key *create_cache_key(pool *p, unsigned long algo,
+    const char *path, time_t mtime, off_t start, size_t len,
+    const char *hex_digest) {
+  int res;
+  struct digest_cache_key *cache_key;
+  pool *sub_pool;
+
+  sub_pool = make_sub_pool(digest_pool);
+  pr_pool_tag(sub_pool, "DigestCache entry");
+
+  cache_key = pcalloc(sub_pool, sizeof(struct digest_cache_key));
+  cache_key->pool = sub_pool;
+  cache_key->path = pstrdup(cache_key->pool, path);
+  cache_key->mtime = mtime;
+  cache_key->start = start;
+  cache_key->len = len;
+  cache_key->algo = algo;
+  cache_key->key = get_key_for_cache(cache_key->pool, path, mtime, start, len);
+  cache_key->hex_digest = pstrdup(cache_key->pool, hex_digest);
+
+  if (digest_cache_keys == NULL) {
+    digest_cache_keys = xaset_create(digest_pool, cache_key_cmp);
+  }
+
+  res = xaset_insert_sort(digest_cache_keys, (xasetmember_t *) cache_key, TRUE);
+  if (res < 0) {
+    pr_trace_msg(trace_channel, 12,
+      "error adding cache key '%s' to set: %s", cache_key->key,
+      strerror(errno));
+  }
+
+  return cache_key;
+}
+
+static struct digest_cache_key *find_cache_key(pool *p, unsigned long algo,
+    const char *path, time_t mtime, off_t start, off_t len) {
+  struct digest_cache_key *cache_key = NULL;
+
+  for (cache_key = (struct digest_cache_key *) digest_cache_keys->xas_list;
+       cache_key != NULL;
+       cache_key = cache_key->next) {
+    if (cache_key->algo != algo) {
+      continue;
+    }
+
+    if (cache_key->mtime != mtime) {
+      continue;
+    }
+
+    if (cache_key->start != start) {
+      continue;
+    }
+
+    if (cache_key->len != len) {
+      continue;
+    }
+
+    if (strcmp(cache_key->path, path) == 0) {
+      return cache_key;
+    }
+  }
+
+  errno = ENOENT;
+  return NULL;
+}
+
+static int destroy_cache_key(pool *p, unsigned long algo, const char *path,
+    time_t mtime, off_t start, off_t len) {
+  struct digest_cache_key *cache_key;
+  int res;
+
+  cache_key = find_cache_key(p, algo, path, mtime, start, len);
+  if (cache_key == NULL) {
+    return -1;
+  }
+
+  res = xaset_remove(digest_cache_keys, (xasetmember_t *) cache_key);
+  if (res < 0) {
+    pr_trace_msg(trace_channel, 12,
+      "error removing cache key '%s' from set: %s", cache_key->key,
+      strerror(errno));
+  }
+
+  destroy_pool(cache_key->pool);
+  return 0;
+}
+
+static int remove_cached_digest(pool *p, unsigned long algo, const char *path,
+    time_t mtime, off_t start, size_t len) {
+  const char *key;
+  pr_table_t *cache;
+
+  cache = get_cache(algo);
+  if (cache == NULL) {
+    return -1;
+  }
+
+  key = get_key_for_cache(p, path, mtime, start, len);
+  if (key == NULL) {
+    return -1;
+  }
+
+  if (pr_table_remove(cache, key, NULL) < 0) {
+    return -1;
+  }
+
+  destroy_cache_key(p, algo, path, mtime, start, len);
+  return 0;
+}
+
+static int add_cached_digest(pool *p, unsigned long algo, const char *path,
+    time_t mtime, off_t start, size_t len, const char *hex_digest) {
+  int res;
+  struct digest_cache_key *cache_key;
+  pr_table_t *cache;
+
+  if (digest_caching == FALSE) {
+    return 0;
+  }
+
+  cache = get_cache(algo);
+  if (cache == NULL) {
+    return -1;
+  }
+
+  cache_key = create_cache_key(p, algo, path, mtime, start, len, hex_digest);
+
+  res = pr_table_add(cache, cache_key->key, (void *) cache_key->hex_digest, 0);
+  if (res == 0) {
+    pr_trace_msg(trace_channel, 12,
+      "cached digest '%s' for %s digest, key '%s'", hex_digest,
+      get_algo_name(algo, 0), cache_key->key);
+  }
+
+  return res;
 }
 
 static char *get_cached_digest(pool *p, unsigned long algo, const char *path,
@@ -1218,7 +1413,7 @@ static char *get_cached_digest(pool *p, unsigned long algo, const char *path,
     return NULL;
   }
 
-  key = get_cache_key(p, path, mtime, start, len);
+  key = get_key_for_cache(p, path, mtime, start, len);
   if (key == NULL) {
     return NULL;
   }
@@ -1242,7 +1437,8 @@ static char *get_cached_digest(pool *p, unsigned long algo, const char *path,
       pr_trace_msg(trace_channel, 12,
         "cached digest for %s digest using key '%s' has expired, evicting",
         algo_name, key);
-      if (pr_table_remove(cache, key, NULL) < 0) {
+
+      if (remove_cached_digest(p, algo, path, mtime, start, len) < 0) {
         pr_trace_msg(trace_channel, 15,
           "error removing key '%s' from %s cache: %s", key, algo_name,
           strerror(errno));
@@ -1263,35 +1459,44 @@ static char *get_cached_digest(pool *p, unsigned long algo, const char *path,
   return NULL;
 }
 
-static int add_cached_digest(pool *p, unsigned long algo, const char *path,
-    time_t mtime, off_t start, size_t len, const char *hex_digest) {
-  int res;
-  const char *key;
-  pr_table_t *cache;
+static int digest_cache_expiry_cb(CALLBACK_FRAME) {
+  struct digest_cache_key *cache_key;
+  time_t now;
 
-  if (digest_caching == FALSE) {
-    return 0;
+  if (digest_cache_keys == NULL ||
+      digest_cache_keys->xas_list == NULL) {
+    /* Empty list; nothing to do. */
+    return 1;
   }
 
-  cache = get_cache(algo);
-  if (cache == NULL) {
-    return -1;
+  time(&now);
+
+  /* We've ordered the keys in the list by mtime.  This means that once
+   * we see keys whose mtime has not exceed the max age, we can stop iterating.
+   */
+
+  for (cache_key = (struct digest_cache_key *) digest_cache_keys->xas_list;
+       cache_key != NULL;
+       cache_key = cache_key->next) {
+    if (now > (cache_key->mtime + digest_cache_max_age)) {
+      if (remove_cached_digest(digest_pool, cache_key->algo, cache_key->path,
+          cache_key->mtime, cache_key->start, cache_key->len) < 0) {
+        pr_trace_msg(trace_channel, 12,
+          "error removing cache key '%s' from set: %s", cache_key->key,
+         strerror(errno));
+
+      } else {
+        pr_trace_msg(trace_channel, 15,
+          "removed expired cache key '%s' from set", cache_key->key);
+      }
+
+    } else {
+      break;
+    }
   }
 
-  key = get_cache_key(p, path, mtime, start, len);
-  if (key == NULL) {
-    return -1;
-  }
-
-  res = pr_table_add_dup(cache, pstrdup(digest_pool, key),
-    (void *) hex_digest, 0);
-  if (res == 0) {
-    pr_trace_msg(trace_channel, 12,
-      "cached digest '%s' for %s digest, key '%s'", hex_digest,
-      get_algo_name(algo, 0), key);
-  }
-
-  return res;
+  /* Always restart the timer. */
+  return 1;
 }
 
 static int check_cache_size(cmd_rec *cmd) {
@@ -2198,6 +2403,20 @@ MODRET digest_post_pass(cmd_rec *cmd) {
     if (digest_caching == TRUE) {
       digest_cache_max_size = *((unsigned int *) c->argv[1]);
       digest_cache_max_age = *((unsigned int *) c->argv[2]);
+    }
+  }
+
+  if (digest_caching == TRUE) {
+    int timerno;
+
+    /* Register a timer for periodically scanning for expired cache entries
+     * to evict.
+     */
+    timerno = pr_timer_add(DIGEST_CACHE_EXPIRY_INTVL, -1, &digest_module,
+      digest_cache_expiry_cb, "DigestCache expiry");
+    if (timerno < 0) {
+      pr_log_debug(DEBUG5, MOD_DIGEST_VERSION
+        ": error adding timer for DigestCache expiration: %s", strerror(errno));
     }
   }
 
