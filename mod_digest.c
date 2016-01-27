@@ -66,8 +66,8 @@
 #endif
 
 /* Make sure the version of proftpd is as necessary. */
-#if PROFTPD_VERSION_NUMBER < 0x0001030304
-# error "ProFTPD 1.3.3 or later required"
+#if PROFTPD_VERSION_NUMBER < 0x0001030602
+# error "ProFTPD 1.3.6rc2 or later required"
 #endif
 
 #if !defined(HAVE_OPENSSL) && !defined(PR_USE_OPENSSL)
@@ -1662,12 +1662,28 @@ static modret_t *digest_xcmd(cmd_rec *cmd, unsigned long algo) {
   }
 
   /* XXX Watch out for paths with spaces in them! */
-  orig_path = cmd->argv[1];
-  path = dir_realpath(cmd->tmp_pool, orig_path);
+  path = orig_path = cmd->argv[1];
+
+  if (pr_fsio_lstat(path, &st) == 0) {
+    if (S_ISLNK(st.st_mode)) {
+      char link_path[PR_TUNABLE_PATH_MAX];
+      int link_len;
+
+      memset(link_path, '\0', sizeof(link_path));
+      link_len = dir_readlink(cmd->tmp_pool, path, link_path,
+        sizeof(link_path)-1, PR_DIR_READLINK_FL_HANDLE_REL_PATH);
+      if (link_len > 0) {
+        link_path[link_len] = '\0';
+        path = pstrdup(cmd->tmp_pool, link_path);
+      }
+    }
+  }
+
+  path = dir_realpath(cmd->tmp_pool, path);
   if (path == NULL) {
     int xerrno = errno;
 
-    pr_response_add_err(R_550, "%s: %s", orig_path, strerror(xerrno));
+    pr_response_add_err(R_550, "%s: %s", cmd->arg, strerror(xerrno));
 
     pr_cmd_set_errno(cmd, xerrno);
     errno = xerrno;
@@ -1810,8 +1826,24 @@ MODRET digest_hash(cmd_rec *cmd) {
 
   CHECK_CMD_MIN_ARGS(cmd, 2);
 
-  orig_path = pr_fs_decode_path(cmd->tmp_pool, cmd->arg);
-  path = dir_realpath(cmd->tmp_pool, orig_path);
+  path = orig_path = pr_fs_decode_path(cmd->tmp_pool, cmd->arg);
+
+  if (pr_fsio_lstat(path, &st) == 0) {
+    if (S_ISLNK(st.st_mode)) {
+      char link_path[PR_TUNABLE_PATH_MAX];
+      int link_len;
+
+      memset(link_path, '\0', sizeof(link_path));
+      link_len = dir_readlink(cmd->tmp_pool, path, link_path,
+        sizeof(link_path)-1, PR_DIR_READLINK_FL_HANDLE_REL_PATH);
+      if (link_len > 0) {
+        link_path[link_len] = '\0';
+        path = pstrdup(cmd->tmp_pool, link_path);
+      }
+    }
+  }
+
+  path = dir_realpath(cmd->tmp_pool, path);
   if (path == NULL) {
     xerrno = errno;
 

@@ -4,6 +4,7 @@ use lib qw(t/lib);
 use base qw(ProFTPD::TestSuite::Child);
 use strict;
 
+use Cwd;
 use File::Copy;
 use File::Path qw(mkpath);
 use File::Spec;
@@ -32,6 +33,26 @@ my $TESTS = {
   digest_hash_crc32 => {
     order => ++$order,
     test_class => [qw(forking)],
+  },
+
+  digest_hash_crc32_abs_symlink => {
+    order => ++$order,
+    test_class => [qw(forking rootprivs)],
+  },
+
+  digest_hash_crc32_abs_symlink_chrooted_bug4219 => {
+    order => ++$order,
+    test_class => [qw(forking rootprivs)],
+  },
+
+  digest_hash_crc32_rel_symlink => {
+    order => ++$order,
+    test_class => [qw(forking rootprivs)],
+  },
+
+  digest_hash_crc32_rel_symlink_chrooted_bug4219 => {
+    order => ++$order,
+    test_class => [qw(forking rootprivs)],
   },
 
   digest_hash_md5 => {
@@ -82,6 +103,26 @@ my $TESTS = {
   digest_xcrc => {
     order => ++$order,
     test_class => [qw(forking)],
+  },
+
+  digest_xcrc_abs_symlink => {
+    order => ++$order,
+    test_class => [qw(forking)],
+  },
+
+  digest_xcrc_abs_symlink_chrooted_bug4219 => {
+    order => ++$order,
+    test_class => [qw(forking rootprivs)],
+  },
+
+  digest_xcrc_rel_symlink => {
+    order => ++$order,
+    test_class => [qw(forking)],
+  },
+
+  digest_xcrc_rel_symlink_chrooted_bug4219 => {
+    order => ++$order,
+    test_class => [qw(forking rootprivs)],
   },
 
   digest_xcrc_2gb => {
@@ -651,6 +692,622 @@ sub digest_hash_crc32 {
       $client->quit();
     };
 
+    if ($@) {
+      $ex = $@;
+    }
+
+    $wfh->print("done\n");
+    $wfh->flush();
+
+  } else {
+    eval { server_wait($setup->{config_file}, $rfh) };
+    if ($@) {
+      warn($@);
+      exit 1;
+    }
+
+    exit 0;
+  }
+
+  # Stop server
+  server_stop($setup->{pid_file});
+  $self->assert_child_ok($pid);
+
+  test_cleanup($setup->{log_file}, $ex);
+}
+
+sub digest_hash_crc32_abs_symlink {
+  my $self = shift;
+  my $tmpdir = $self->{tmpdir};
+  my $setup = test_setup($tmpdir, 'digest');
+
+  require Digest::CRC;
+
+  my $test_dir = File::Spec->rel2abs("$tmpdir/test.d");
+  mkpath($test_dir);
+
+  my $test_file = File::Spec->rel2abs("$test_dir/test.txt");
+  if (open(my $fh, "> $test_file")) {
+    print $fh "Hello, World!\n";
+    unless (close($fh)) {
+      die("Can't write $test_file: $!");
+    }
+
+  } else {
+    die("Can't open $test_file: $!");
+  }
+
+  my $expected_digest;
+
+  if (open(my $fh, "< $test_file")) {
+    my $ctx = Digest::CRC->new(type => 'crc32');
+    $ctx->addfile($fh);
+    $expected_digest = lc($ctx->hexdigest);
+    close($fh);
+
+  } else {
+    die("Can't read $test_file: $!");
+  }
+
+  my $test_symlink = File::Spec->rel2abs("$test_dir/test.lnk");
+
+  my $dst_path = $test_file;
+  if ($^O eq 'darwin') {
+    # MacOSX-specific hack
+    $dst_path = '/private' . $dst_path;
+  }
+
+  unless (symlink($dst_path, $test_symlink)) {
+    die("Can't symlink $test_symlink to $dst_path: $!");
+  }
+
+  if ($< == 0) {
+    unless (chmod(0755, $test_dir)) {
+      die("Can't set perms on $test_dir to 0755: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_dir)) {
+      die("Can't set owner of $test_dir to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $config = {
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
+    Trace => 'digest:20',
+
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+
+    IfModules => {
+      'mod_delay.c' => {
+        DelayEngine => 'off',
+      },
+
+      'mod_digest.c' => {
+        DigestEngine => 'on',
+      },
+    },
+  };
+
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
+
+  # Open pipes, for use between the parent and child processes.  Specifically,
+  # the child will indicate when it's done with its test by writing a message
+  # to the parent.
+  my ($rfh, $wfh);
+  unless (pipe($rfh, $wfh)) {
+    die("Can't open pipe: $!");
+  }
+
+  my $ex;
+
+  # Fork child
+  $self->handle_sigchld();
+  defined(my $pid = fork()) or die("Can't fork: $!");
+  if ($pid) {
+    eval {
+      # Allow server to start up
+      sleep(1);
+
+      my $client = ProFTPD::TestSuite::FTP->new('127.0.0.1', $port, 0, 1);
+      $client->login($setup->{user}, $setup->{passwd});
+
+      my $algo = 'CRC32';
+      my ($resp_code, $resp_msg) = $client->opts('HASH', $algo);
+
+      my $expected;
+
+      $expected = 200;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = $algo;
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+
+      my $path = 'test.d/test.lnk';
+      ($resp_code, $resp_msg) = $client->quote('HASH', $path);
+
+      $expected = 213;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      my $filesz = -s $test_file;
+      $expected = "$algo 0-$filesz $expected_digest $path";
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+
+      $client->quit();
+    };
+    if ($@) {
+      $ex = $@;
+    }
+
+    $wfh->print("done\n");
+    $wfh->flush();
+
+  } else {
+    eval { server_wait($setup->{config_file}, $rfh) };
+    if ($@) {
+      warn($@);
+      exit 1;
+    }
+
+    exit 0;
+  }
+
+  # Stop server
+  server_stop($setup->{pid_file});
+  $self->assert_child_ok($pid);
+
+  test_cleanup($setup->{log_file}, $ex);
+}
+
+sub digest_hash_crc32_abs_symlink_chrooted_bug4219 {
+  my $self = shift;
+  my $tmpdir = $self->{tmpdir};
+  my $setup = test_setup($tmpdir, 'digest');
+
+  require Digest::CRC;
+
+  my $test_dir = File::Spec->rel2abs("$tmpdir/test.d");
+  mkpath($test_dir);
+
+  my $test_file = File::Spec->rel2abs("$test_dir/test.txt");
+  if (open(my $fh, "> $test_file")) {
+    print $fh "Hello, World!\n";
+    unless (close($fh)) {
+      die("Can't write $test_file: $!");
+    }
+
+  } else {
+    die("Can't open $test_file: $!");
+  }
+
+  my $expected_digest;
+
+  if (open(my $fh, "< $test_file")) {
+    my $ctx = Digest::CRC->new(type => 'crc32');
+    $ctx->addfile($fh);
+    $expected_digest = lc($ctx->hexdigest);
+    close($fh);
+
+  } else {
+    die("Can't read $test_file: $!");
+  }
+
+  my $test_symlink = File::Spec->rel2abs("$test_dir/test.lnk");
+
+  my $dst_path = $test_file;
+  if ($^O eq 'darwin') {
+    # MacOSX-specific hack
+    $dst_path = '/private' . $dst_path;
+  }
+
+  unless (symlink($dst_path, $test_symlink)) {
+    die("Can't symlink $test_symlink to $dst_path: $!");
+  }
+
+  if ($< == 0) {
+    unless (chmod(0755, $test_dir)) {
+      die("Can't set perms on $test_dir to 0755: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_dir)) {
+      die("Can't set owner of $test_dir to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $config = {
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
+    Trace => 'digest:20',
+
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+
+    DefaultRoot => '~',
+
+    IfModules => {
+      'mod_delay.c' => {
+        DelayEngine => 'off',
+      },
+
+      'mod_digest.c' => {
+        DigestEngine => 'on',
+      },
+    },
+  };
+
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
+
+  # Open pipes, for use between the parent and child processes.  Specifically,
+  # the child will indicate when it's done with its test by writing a message
+  # to the parent.
+  my ($rfh, $wfh);
+  unless (pipe($rfh, $wfh)) {
+    die("Can't open pipe: $!");
+  }
+
+  my $ex;
+
+  # Fork child
+  $self->handle_sigchld();
+  defined(my $pid = fork()) or die("Can't fork: $!");
+  if ($pid) {
+    eval {
+      # Allow server to start up
+      sleep(1);
+
+      my $client = ProFTPD::TestSuite::FTP->new('127.0.0.1', $port, 0, 1);
+      $client->login($setup->{user}, $setup->{passwd});
+
+      my $algo = 'CRC32';
+      my ($resp_code, $resp_msg) = $client->opts('HASH', $algo);
+
+      my $expected;
+
+      $expected = 200;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = $algo;
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+
+      my $path = 'test.d/test.lnk';
+      ($resp_code, $resp_msg) = $client->quote('HASH', $path);
+
+      $expected = 213;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      my $filesz = -s $test_file;
+      $expected = "$algo 0-$filesz $expected_digest $path";
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+
+      $client->quit();
+    };
+    if ($@) {
+      $ex = $@;
+    }
+
+    $wfh->print("done\n");
+    $wfh->flush();
+
+  } else {
+    eval { server_wait($setup->{config_file}, $rfh) };
+    if ($@) {
+      warn($@);
+      exit 1;
+    }
+
+    exit 0;
+  }
+
+  # Stop server
+  server_stop($setup->{pid_file});
+  $self->assert_child_ok($pid);
+
+  test_cleanup($setup->{log_file}, $ex);
+}
+
+sub digest_hash_crc32_rel_symlink {
+  my $self = shift;
+  my $tmpdir = $self->{tmpdir};
+  my $setup = test_setup($tmpdir, 'digest');
+
+  require Digest::CRC;
+
+  my $test_dir = File::Spec->rel2abs("$tmpdir/test.d");
+  mkpath($test_dir);
+
+  my $test_file = File::Spec->rel2abs("$test_dir/test.txt");
+  if (open(my $fh, "> $test_file")) {
+    print $fh "Hello, World!\n";
+    unless (close($fh)) {
+      die("Can't write $test_file: $!");
+    }
+
+  } else {
+    die("Can't open $test_file: $!");
+  }
+
+  my $expected_digest;
+
+  if (open(my $fh, "< $test_file")) {
+    my $ctx = Digest::CRC->new(type => 'crc32');
+    $ctx->addfile($fh);
+    $expected_digest = lc($ctx->hexdigest);
+    close($fh);
+
+  } else {
+    die("Can't read $test_file: $!");
+  }
+
+  # Change to the test directory in order to create a relative path in the
+  # symlink we need
+
+  my $cwd = getcwd();
+  unless (chdir($test_dir)) {
+    die("Can't chdir to $test_dir: $!");
+  }
+
+  unless (symlink('./test.txt', './test.lnk')) {
+    die("Can't symlink 'test.lnk' to './test.txt': $!");
+  }
+
+  unless (chdir($cwd)) {
+    die("Can't chdir to $cwd: $!");
+  }
+
+  if ($< == 0) {
+    unless (chmod(0755, $test_dir)) {
+      die("Can't set perms on $test_dir to 0755: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_dir)) {
+      die("Can't set owner of $test_dir to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $config = {
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
+    Trace => 'digest:20',
+
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+
+    IfModules => {
+      'mod_delay.c' => {
+        DelayEngine => 'off',
+      },
+
+      'mod_digest.c' => {
+        DigestEngine => 'on',
+      },
+    },
+  };
+
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
+
+  # Open pipes, for use between the parent and child processes.  Specifically,
+  # the child will indicate when it's done with its test by writing a message
+  # to the parent.
+  my ($rfh, $wfh);
+  unless (pipe($rfh, $wfh)) {
+    die("Can't open pipe: $!");
+  }
+
+  my $ex;
+
+  # Fork child
+  $self->handle_sigchld();
+  defined(my $pid = fork()) or die("Can't fork: $!");
+  if ($pid) {
+    eval {
+      # Allow server to start up
+      sleep(1);
+
+      my $client = ProFTPD::TestSuite::FTP->new('127.0.0.1', $port, 0, 1);
+      $client->login($setup->{user}, $setup->{passwd});
+
+      my $algo = 'CRC32';
+      my ($resp_code, $resp_msg) = $client->opts('HASH', $algo);
+
+      my $expected;
+
+      $expected = 200;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = $algo;
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+
+      my $path = 'test.d/test.lnk';
+      ($resp_code, $resp_msg) = $client->quote('HASH', $path);
+
+      $expected = 213;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      my $filesz = -s $test_file;
+      $expected = "$algo 0-$filesz $expected_digest $path";
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+
+      $client->quit();
+    };
+    if ($@) {
+      $ex = $@;
+    }
+
+    $wfh->print("done\n");
+    $wfh->flush();
+
+  } else {
+    eval { server_wait($setup->{config_file}, $rfh) };
+    if ($@) {
+      warn($@);
+      exit 1;
+    }
+
+    exit 0;
+  }
+
+  # Stop server
+  server_stop($setup->{pid_file});
+  $self->assert_child_ok($pid);
+
+  test_cleanup($setup->{log_file}, $ex);
+}
+
+sub digest_hash_crc32_rel_symlink_chrooted_bug4219 {
+  my $self = shift;
+  my $tmpdir = $self->{tmpdir};
+  my $setup = test_setup($tmpdir, 'digest');
+
+  require Digest::CRC;
+
+  my $test_dir = File::Spec->rel2abs("$tmpdir/test.d");
+  mkpath($test_dir);
+
+  my $test_file = File::Spec->rel2abs("$test_dir/test.txt");
+  if (open(my $fh, "> $test_file")) {
+    print $fh "Hello, World!\n";
+    unless (close($fh)) {
+      die("Can't write $test_file: $!");
+    }
+
+  } else {
+    die("Can't open $test_file: $!");
+  }
+
+  my $expected_digest;
+
+  if (open(my $fh, "< $test_file")) {
+    my $ctx = Digest::CRC->new(type => 'crc32');
+    $ctx->addfile($fh);
+    $expected_digest = lc($ctx->hexdigest);
+    close($fh);
+
+  } else {
+    die("Can't read $test_file: $!");
+  }
+
+  # Change to the test directory in order to create a relative path in the
+  # symlink we need
+
+  my $cwd = getcwd();
+  unless (chdir($test_dir)) {
+    die("Can't chdir to $test_dir: $!");
+  }
+
+  unless (symlink('./test.txt', './test.lnk')) {
+    die("Can't symlink 'test.lnk' to './test.txt': $!");
+  }
+
+  unless (chdir($cwd)) {
+    die("Can't chdir to $cwd: $!");
+  }
+
+  if ($< == 0) {
+    unless (chmod(0755, $test_dir)) {
+      die("Can't set perms on $test_dir to 0755: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_dir)) {
+      die("Can't set owner of $test_dir to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $config = {
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
+    Trace => 'digest:20',
+
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+
+    DefaultRoot => '~',
+
+    IfModules => {
+      'mod_delay.c' => {
+        DelayEngine => 'off',
+      },
+
+      'mod_digest.c' => {
+        DigestEngine => 'on',
+      },
+    },
+  };
+
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
+
+  # Open pipes, for use between the parent and child processes.  Specifically,
+  # the child will indicate when it's done with its test by writing a message
+  # to the parent.
+  my ($rfh, $wfh);
+  unless (pipe($rfh, $wfh)) {
+    die("Can't open pipe: $!");
+  }
+
+  my $ex;
+
+  # Fork child
+  $self->handle_sigchld();
+  defined(my $pid = fork()) or die("Can't fork: $!");
+  if ($pid) {
+    eval {
+      # Allow server to start up
+      sleep(1);
+
+      my $client = ProFTPD::TestSuite::FTP->new('127.0.0.1', $port, 0, 1);
+      $client->login($setup->{user}, $setup->{passwd});
+
+      my $algo = 'CRC32';
+      my ($resp_code, $resp_msg) = $client->opts('HASH', $algo);
+
+      my $expected;
+
+      $expected = 200;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = $algo;
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+
+      my $path = 'test.d/test.lnk';
+      ($resp_code, $resp_msg) = $client->quote('HASH', $path);
+
+      $expected = 213;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      my $filesz = -s $test_file;
+      $expected = "$algo 0-$filesz $expected_digest $path";
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+
+      $client->quit();
+    };
     if ($@) {
       $ex = $@;
     }
@@ -1838,6 +2495,562 @@ sub digest_xcrc {
         test_msg("Expected response message '$expected', got '$resp_msg'"));
     };
 
+    if ($@) {
+      $ex = $@;
+    }
+
+    $wfh->print("done\n");
+    $wfh->flush();
+
+  } else {
+    eval { server_wait($setup->{config_file}, $rfh) };
+    if ($@) {
+      warn($@);
+      exit 1;
+    }
+
+    exit 0;
+  }
+
+  # Stop server
+  server_stop($setup->{pid_file});
+  $self->assert_child_ok($pid);
+
+  test_cleanup($setup->{log_file}, $ex);
+}
+
+sub digest_xcrc_abs_symlink {
+  my $self = shift;
+  my $tmpdir = $self->{tmpdir};
+  my $setup = test_setup($tmpdir, 'digest');
+
+  require Digest::CRC;
+
+  my $test_dir = File::Spec->rel2abs("$tmpdir/test.d");
+  mkpath($test_dir);
+
+  my $test_file = File::Spec->rel2abs("$test_dir/test.txt");
+  if (open(my $fh, "> $test_file")) {
+    print $fh "Hello, World!\n";
+    unless (close($fh)) {
+      die("Can't write $test_file: $!");
+    }
+
+  } else {
+    die("Can't open $test_file: $!");
+  }
+
+  my $expected_digest;
+
+  if (open(my $fh, "< $test_file")) {
+    my $ctx = Digest::CRC->new(type => 'crc32');
+    $ctx->addfile($fh);
+    $expected_digest = uc($ctx->hexdigest);
+    close($fh);
+
+  } else {
+    die("Can't read $test_file: $!");
+  }
+
+  my $test_symlink = File::Spec->rel2abs("$test_dir/test.lnk");
+
+  my $dst_path = $test_file;
+  if ($^O eq 'darwin') {
+    # MacOSX-specific hack
+    $dst_path = '/private' . $dst_path;
+  }
+
+  unless (symlink($dst_path, $test_symlink)) {
+    die("Can't symlink $test_symlink to $dst_path: $!");
+  }
+
+  if ($< == 0) {
+    unless (chmod(0755, $test_dir)) {
+      die("Can't set perms on $test_dir to 0755: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_dir)) {
+      die("Can't set owner of $test_dir to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $config = {
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
+    Trace => 'digest:20',
+
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+
+    IfModules => {
+      'mod_delay.c' => {
+        DelayEngine => 'off',
+      },
+
+      'mod_digest.c' => {
+        DigestEngine => 'on',
+      },
+    },
+  };
+
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
+
+  # Open pipes, for use between the parent and child processes.  Specifically,
+  # the child will indicate when it's done with its test by writing a message
+  # to the parent.
+  my ($rfh, $wfh);
+  unless (pipe($rfh, $wfh)) {
+    die("Can't open pipe: $!");
+  }
+
+  my $ex;
+
+  # Fork child
+  $self->handle_sigchld();
+  defined(my $pid = fork()) or die("Can't fork: $!");
+  if ($pid) {
+    eval {
+      # Allow server to start up
+      sleep(1);
+
+      my $client = ProFTPD::TestSuite::FTP->new('127.0.0.1', $port, 0, 1);
+      $client->login($setup->{user}, $setup->{passwd});
+
+      my $path = 'test.d/test.lnk';
+      my ($resp_code, $resp_msg) = $client->quote('XCRC', $path);
+      $client->quit();
+
+      my $expected = 250;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = $expected_digest;
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+    };
+    if ($@) {
+      $ex = $@;
+    }
+
+    $wfh->print("done\n");
+    $wfh->flush();
+
+  } else {
+    eval { server_wait($setup->{config_file}, $rfh) };
+    if ($@) {
+      warn($@);
+      exit 1;
+    }
+
+    exit 0;
+  }
+
+  # Stop server
+  server_stop($setup->{pid_file});
+  $self->assert_child_ok($pid);
+
+  test_cleanup($setup->{log_file}, $ex);
+}
+
+sub digest_xcrc_abs_symlink_chrooted_bug4219 {
+  my $self = shift;
+  my $tmpdir = $self->{tmpdir};
+  my $setup = test_setup($tmpdir, 'digest');
+
+  require Digest::CRC;
+
+  my $test_dir = File::Spec->rel2abs("$tmpdir/test.d");
+  mkpath($test_dir);
+
+  my $test_file = File::Spec->rel2abs("$test_dir/test.txt");
+  if (open(my $fh, "> $test_file")) {
+    print $fh "Hello, World!\n";
+    unless (close($fh)) {
+      die("Can't write $test_file: $!");
+    }
+
+  } else {
+    die("Can't open $test_file: $!");
+  }
+
+  my $expected_digest;
+
+  if (open(my $fh, "< $test_file")) {
+    my $ctx = Digest::CRC->new(type => 'crc32');
+    $ctx->addfile($fh);
+    $expected_digest = uc($ctx->hexdigest);
+    close($fh);
+
+  } else {
+    die("Can't read $test_file: $!");
+  }
+
+  my $test_symlink = File::Spec->rel2abs("$test_dir/test.lnk");
+
+  my $dst_path = $test_file;
+  if ($^O eq 'darwin') {
+    # MacOSX-specific hack
+    $dst_path = '/private' . $dst_path;
+  }
+
+  unless (symlink($dst_path, $test_symlink)) {
+    die("Can't symlink $test_symlink to $dst_path: $!");
+  }
+
+  if ($< == 0) {
+    unless (chmod(0755, $test_dir)) {
+      die("Can't set perms on $test_dir to 0755: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_dir)) {
+      die("Can't set owner of $test_dir to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $config = {
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
+    Trace => 'digest:20',
+
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+
+    DefaultRoot => '~',
+
+    IfModules => {
+      'mod_delay.c' => {
+        DelayEngine => 'off',
+      },
+
+      'mod_digest.c' => {
+        DigestEngine => 'on',
+      },
+    },
+  };
+
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
+
+  # Open pipes, for use between the parent and child processes.  Specifically,
+  # the child will indicate when it's done with its test by writing a message
+  # to the parent.
+  my ($rfh, $wfh);
+  unless (pipe($rfh, $wfh)) {
+    die("Can't open pipe: $!");
+  }
+
+  my $ex;
+
+  # Fork child
+  $self->handle_sigchld();
+  defined(my $pid = fork()) or die("Can't fork: $!");
+  if ($pid) {
+    eval {
+      # Allow server to start up
+      sleep(1);
+
+      my $client = ProFTPD::TestSuite::FTP->new('127.0.0.1', $port, 0, 1);
+      $client->login($setup->{user}, $setup->{passwd});
+
+      my $path = 'test.d/test.lnk';
+      my ($resp_code, $resp_msg) = $client->quote('XCRC', $path);
+      $client->quit();
+
+      my $expected = 250;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = $expected_digest;
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+    };
+    if ($@) {
+      $ex = $@;
+    }
+
+    $wfh->print("done\n");
+    $wfh->flush();
+
+  } else {
+    eval { server_wait($setup->{config_file}, $rfh) };
+    if ($@) {
+      warn($@);
+      exit 1;
+    }
+
+    exit 0;
+  }
+
+  # Stop server
+  server_stop($setup->{pid_file});
+  $self->assert_child_ok($pid);
+
+  test_cleanup($setup->{log_file}, $ex);
+}
+
+sub digest_xcrc_rel_symlink {
+  my $self = shift;
+  my $tmpdir = $self->{tmpdir};
+  my $setup = test_setup($tmpdir, 'digest');
+
+  require Digest::CRC;
+
+  my $test_dir = File::Spec->rel2abs("$tmpdir/test.d");
+  mkpath($test_dir);
+
+  my $test_file = File::Spec->rel2abs("$test_dir/test.txt");
+  if (open(my $fh, "> $test_file")) {
+    print $fh "Hello, World!\n";
+    unless (close($fh)) {
+      die("Can't write $test_file: $!");
+    }
+
+  } else {
+    die("Can't open $test_file: $!");
+  }
+
+  my $expected_digest;
+
+  if (open(my $fh, "< $test_file")) {
+    my $ctx = Digest::CRC->new(type => 'crc32');
+    $ctx->addfile($fh);
+    $expected_digest = uc($ctx->hexdigest);
+    close($fh);
+
+  } else {
+    die("Can't read $test_file: $!");
+  }
+
+  # Change to the test directory in order to create a relative path in the
+  # symlink we need
+
+  my $cwd = getcwd();
+  unless (chdir($test_dir)) {
+    die("Can't chdir to $test_dir: $!");
+  }
+
+  unless (symlink('./test.txt', './test.lnk')) {
+    die("Can't symlink 'test.lnk' to './test.txt': $!");
+  }
+
+  unless (chdir($cwd)) {
+    die("Can't chdir to $cwd: $!");
+  }
+
+  if ($< == 0) {
+    unless (chmod(0755, $test_dir)) {
+      die("Can't set perms on $test_dir to 0755: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_dir)) {
+      die("Can't set owner of $test_dir to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $config = {
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
+    Trace => 'digest:20',
+
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+
+    IfModules => {
+      'mod_delay.c' => {
+        DelayEngine => 'off',
+      },
+
+      'mod_digest.c' => {
+        DigestEngine => 'on',
+      },
+    },
+  };
+
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
+
+  # Open pipes, for use between the parent and child processes.  Specifically,
+  # the child will indicate when it's done with its test by writing a message
+  # to the parent.
+  my ($rfh, $wfh);
+  unless (pipe($rfh, $wfh)) {
+    die("Can't open pipe: $!");
+  }
+
+  my $ex;
+
+  # Fork child
+  $self->handle_sigchld();
+  defined(my $pid = fork()) or die("Can't fork: $!");
+  if ($pid) {
+    eval {
+      # Allow server to start up
+      sleep(1);
+
+      my $client = ProFTPD::TestSuite::FTP->new('127.0.0.1', $port, 0, 1);
+      $client->login($setup->{user}, $setup->{passwd});
+
+      my $path = 'test.d/test.lnk';
+      my ($resp_code, $resp_msg) = $client->quote('XCRC', $path);
+      $client->quit();
+
+      my $expected = 250;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = $expected_digest;
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+    };
+    if ($@) {
+      $ex = $@;
+    }
+
+    $wfh->print("done\n");
+    $wfh->flush();
+
+  } else {
+    eval { server_wait($setup->{config_file}, $rfh) };
+    if ($@) {
+      warn($@);
+      exit 1;
+    }
+
+    exit 0;
+  }
+
+  # Stop server
+  server_stop($setup->{pid_file});
+  $self->assert_child_ok($pid);
+
+  test_cleanup($setup->{log_file}, $ex);
+}
+
+sub digest_xcrc_rel_symlink_chrooted_bug4219 {
+  my $self = shift;
+  my $tmpdir = $self->{tmpdir};
+  my $setup = test_setup($tmpdir, 'digest');
+
+  require Digest::CRC;
+
+  my $test_dir = File::Spec->rel2abs("$tmpdir/test.d");
+  mkpath($test_dir);
+
+  my $test_file = File::Spec->rel2abs("$test_dir/test.txt");
+  if (open(my $fh, "> $test_file")) {
+    print $fh "Hello, World!\n";
+    unless (close($fh)) {
+      die("Can't write $test_file: $!");
+    }
+
+  } else {
+    die("Can't open $test_file: $!");
+  }
+
+  my $expected_digest;
+
+  if (open(my $fh, "< $test_file")) {
+    my $ctx = Digest::CRC->new(type => 'crc32');
+    $ctx->addfile($fh);
+    $expected_digest = uc($ctx->hexdigest);
+    close($fh);
+
+  } else {
+    die("Can't read $test_file: $!");
+  }
+
+  # Change to the test directory in order to create a relative path in the
+  # symlink we need
+
+  my $cwd = getcwd();
+  unless (chdir($test_dir)) {
+    die("Can't chdir to $test_dir: $!");
+  }
+
+  unless (symlink('./test.txt', './test.lnk')) {
+    die("Can't symlink 'test.lnk' to './test.txt': $!");
+  }
+
+  unless (chdir($cwd)) {
+    die("Can't chdir to $cwd: $!");
+  }
+
+  if ($< == 0) {
+    unless (chmod(0755, $test_dir)) {
+      die("Can't set perms on $test_dir to 0755: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_dir)) {
+      die("Can't set owner of $test_dir to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $config = {
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
+    Trace => 'digest:20',
+
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+
+    DefaultRoot => '~',
+
+    IfModules => {
+      'mod_delay.c' => {
+        DelayEngine => 'off',
+      },
+
+      'mod_digest.c' => {
+        DigestEngine => 'on',
+      },
+    },
+  };
+
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
+
+  # Open pipes, for use between the parent and child processes.  Specifically,
+  # the child will indicate when it's done with its test by writing a message
+  # to the parent.
+  my ($rfh, $wfh);
+  unless (pipe($rfh, $wfh)) {
+    die("Can't open pipe: $!");
+  }
+
+  my $ex;
+
+  # Fork child
+  $self->handle_sigchld();
+  defined(my $pid = fork()) or die("Can't fork: $!");
+  if ($pid) {
+    eval {
+      # Allow server to start up
+      sleep(1);
+
+      my $client = ProFTPD::TestSuite::FTP->new('127.0.0.1', $port, 0, 1);
+      $client->login($setup->{user}, $setup->{passwd});
+
+      my $path = 'test.d/test.lnk';
+      my ($resp_code, $resp_msg) = $client->quote('XCRC', $path);
+      $client->quit();
+
+      my $expected = 250;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = $expected_digest;
+      $self->assert($expected eq $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+    };
     if ($@) {
       $ex = $@;
     }
