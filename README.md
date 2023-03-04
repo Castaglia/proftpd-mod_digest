@@ -7,3 +7,7 @@ These can be used by FTP clients for verifying that the files that have been
 uploaded (or downloaded) match exactly the files on the server.
 
 See the [mod_digest.html](https://htmlpreview.github.io/?https://github.com/Castaglia/proftpd-mod_digest/blob/master/mod_digest.html) documentation for more details.
+
+IMPORTANT
+=========
+The `mod_digest` module is now distributed with the [ProFTPD source code](https://github.com/proftpd/proftpd); this repo is now archived.
